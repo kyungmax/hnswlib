@@ -119,7 +119,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         // 각 노드마다 가지는 이웃 리스트의 크기
         // 무제한 edge 추가를 위해 버퍼를 100으로 확장
-        size_links_level0_ = (maxM0_+ 100) * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = (maxM0_) * sizeof(tableint) + sizeof(linklistsizeint);
         // 본인 + 이웃 크기인건가?
         size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
         offsetData_ = size_links_level0_;
