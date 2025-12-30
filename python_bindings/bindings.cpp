@@ -351,14 +351,28 @@ class Index {
 
         // 4. ParallelFor를 사용하여 병렬 처리
         ParallelFor(0, count, num_threads, [&](size_t i, size_t threadId) {
-            size_t u = sources_ptr[i]; // Hub (Source)
-            size_t v = targets_ptr[i]; // High-LID Node (Target)
+            size_t u_label = sources_ptr[i]; // 외부 라벨
+            size_t v_label = targets_ptr[i]; // 외부 라벨
 
-            // 아까 만든 Thread-Safe 함수 호출
-            // (주의: forcedInsertLayer0EdgeWithLock은 내부 ID(tableint)를 받음)
-            // Python에서 들어온 ID가 외부 Label이라면 내부 ID로 변환 필요하지만,
-            // 현재 repair 로직은 내부 ID 기준이므로 그대로 전달
-            appr_alg->forcedInsertLayer0EdgeWithLock((hnswlib::tableint)u, (hnswlib::tableint)v);
+            hnswlib::tableint u_internal, v_internal;
+
+            // 1. label_lookup_을 통해 외부 라벨을 내부 ID로 변환
+            {
+                std::unique_lock<std::mutex> lock(appr_alg->label_lookup_lock); //
+                auto it_u = appr_alg->label_lookup_.find(u_label);
+                auto it_v = appr_alg->label_lookup_.find(v_label);
+
+                // 라벨이 존재하지 않는 경우 스킵
+                if (it_u == appr_alg->label_lookup_.end() || it_v == appr_alg->label_lookup_.end()) {
+                    return;
+                }
+
+                u_internal = it_u->second;
+                v_internal = it_v->second;
+            }
+
+            // 2. 변환된 내부 ID(tableint)를 사용하여 에지 삽입
+            appr_alg->forcedInsertLayer0EdgeWithLock(u_internal, v_internal); //
         });
     }
 
