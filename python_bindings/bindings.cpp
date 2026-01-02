@@ -304,10 +304,29 @@ class Index {
         }
     }
 
-    py::object getLayer0NeighborsWithDistances() {
-        auto nodes = appr_alg->getLayer0NeighborsWithDistances();
-        return py::cast(nodes);
-    }
+	py::object getLayer0NeighborsWithDistances() {
+    	// 1. 내부 ID 기반의 인접 리스트를 가져옴
+    	auto nodes_internal = appr_alg->getLayer0NeighborsWithDistances();
+
+    	// 2. 외부 반환을 위한 Label 기반 맵 선언
+    	std::unordered_map<hnswlib::labeltype, std::vector<std::pair<hnswlib::labeltype, float>>> adj_labels;
+    	adj_labels.reserve(nodes_internal.size());
+
+	    for (auto const& [u_internal, neighbors] : nodes_internal) {
+        	// Source 노드 변환
+        	hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_internal);
+
+        	std::vector<std::pair<hnswlib::labeltype, float>> nbrs_labels;
+        	nbrs_labels.reserve(neighbors.size());
+
+        	for (auto const& [v_internal, dist] : neighbors) {
+            	// Target 노드 변환
+            	nbrs_labels.push_back({appr_alg->getExternalLabel(v_internal), dist});
+        	}
+        	adj_labels[u_label] = std::move(nbrs_labels);
+    	}
+    	return py::cast(adj_labels);
+	}
 
     void forcedInsertLayer0Edge(
         size_t from,
@@ -351,11 +370,28 @@ class Index {
 
         // 4. ParallelFor를 사용하여 병렬 처리
         ParallelFor(0, count, num_threads, [&](size_t i, size_t threadId) {
-            hnswlib::tableint u_internal = (hnswlib::tableint)sources_ptr[i];
-        	hnswlib::tableint v_internal = (hnswlib::tableint)targets_ptr[i];
+            size_t u_label = sources_ptr[i]; // 외부 라벨
+            size_t v_label = targets_ptr[i]; // 외부 라벨
 
-        	// Lock만 잡고 즉시 삽입 (Lookup 생략)
-        	appr_alg->forcedInsertLayer0EdgeWithLock(u_internal, v_internal);
+            hnswlib::tableint u_internal, v_internal;
+
+            // 1. label_lookup_을 통해 외부 라벨을 내부 ID로 변환
+            {
+                std::unique_lock<std::mutex> lock(appr_alg->label_lookup_lock); //
+                auto it_u = appr_alg->label_lookup_.find(u_label);
+                auto it_v = appr_alg->label_lookup_.find(v_label);
+
+                // 라벨이 존재하지 않는 경우 스킵
+                if (it_u == appr_alg->label_lookup_.end() || it_v == appr_alg->label_lookup_.end()) {
+                    return;
+                }
+
+                u_internal = it_u->second;
+                v_internal = it_v->second;
+            }
+
+            // 2. 변환된 내부 ID(tableint)를 사용하여 에지 삽입
+            appr_alg->forcedInsertLayer0EdgeWithLock(u_internal, v_internal); //
         });
     }
 
@@ -364,45 +400,66 @@ class Index {
      * 쿼리셋을 통으로 받아 병렬로 search_layer0_path를 수행
      * Returns: List[List[int]] (각 쿼리별 방문 노드 리스트의 리스트)
      */
-    py::object searchLayer0PathBatch(
-        py::object input,
-        size_t ef,
-        int num_threads = -1
-    ) {
-        py::array_t < float, py::array::c_style | py::array::forcecast > items(input);
-        auto buffer = items.request();
-        size_t rows, features;
-        get_input_array_shapes(buffer, &rows, &features);
+    /*
+ * [수정본] 배치 병렬 경로 탐색
+ * 내부 ID(tableint) 대신 외부 라벨(labeltype)의 리스트를 반환하도록 변경
+ */
+	py::object searchLayer0PathBatch(
+	    py::object input,
+	    size_t ef,
+    	int num_threads = -1
+	) {
+    	py::array_t < float, py::array::c_style | py::array::forcecast > items(input);
+    	auto buffer = items.request();
+    	size_t rows, features;
+    	get_input_array_shapes(buffer, &rows, &features);
 
-        if (num_threads <= 0) num_threads = num_threads_default;
+    	if (num_threads <= 0) num_threads = num_threads_default;
 
-        // 결과 저장용 벡터 (Row별로 가변 길이 벡터 저장)
-        std::vector<std::vector<hnswlib::tableint>> results(rows);
+    	// [변경] 결과 저장용 타입을 tableint에서 labeltype으로 변경
+    	std::vector<std::vector<hnswlib::labeltype>> results(rows);
 
-        {
-            // GIL 해제하여 병렬 처리 허용
-            py::gil_scoped_release l;
+    	{
+        	// GIL 해제하여 병렬 처리 허용
+        	py::gil_scoped_release l;
 
-            if (normalize == false) {
-                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                    // 각 스레드가 독립적으로 경로 탐색 후 results[row]에 저장
-                    results[row] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
-                });
-            } else {
-                // Cosine 유사도 등을 위한 정규화 처리
-                std::vector<float> norm_array(num_threads * features);
-                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                    size_t start_idx = threadId * dim;
-                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+        	if (normalize == false) {
+            	ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                	// 1. 내부 ID 경로 탐색 수행
+                	std::vector<hnswlib::tableint> path_internal = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
 
-                    results[row] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
-                });
-            }
-        }
+                	// 2. 내부 ID를 외부 라벨로 변환하여 결과 벡터에 저장
+                	std::vector<hnswlib::labeltype> path_labels;
+                	path_labels.reserve(path_internal.size());
+                	for (auto id : path_internal) {
+	                    path_labels.push_back(appr_alg->getExternalLabel(id));
+    	            }
+        	        results[row] = std::move(path_labels);
+            	});
+        	} else {
+            	// Cosine 유사도 등을 위한 정규화 처리
+            	std::vector<float> norm_array(num_threads * features);
+            	ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                	size_t start_idx = threadId * dim;
+                	normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
 
-        // C++ vector<vector> -> Python List[List] 자동 변환
-        return py::cast(results);
-    }
+                	// 1. 내부 ID 경로 탐색 수행
+                	std::vector<hnswlib::tableint> path_internal = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
+
+                	// 2. 내부 ID를 외부 라벨로 변환
+                	std::vector<hnswlib::labeltype> path_labels;
+                	path_labels.reserve(path_internal.size());
+                	for (auto id : path_internal) {
+                    	path_labels.push_back(appr_alg->getExternalLabel(id));
+                	}
+                	results[row] = std::move(path_labels);
+            	});
+        	}
+    	}
+
+	    // [결과] 이제 Python은 항상 Label 리스트의 리스트를 받게 됨
+	    return py::cast(results);
+	}
 
     py::object knnQueryAdaptive(
         py::object input,
