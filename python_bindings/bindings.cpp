@@ -351,11 +351,28 @@ class Index {
 
         // 4. ParallelFor를 사용하여 병렬 처리
         ParallelFor(0, count, num_threads, [&](size_t i, size_t threadId) {
-            hnswlib::tableint u_internal = (hnswlib::tableint)sources_ptr[i];
-        	hnswlib::tableint v_internal = (hnswlib::tableint)targets_ptr[i];
+            size_t u_label = sources_ptr[i]; // 외부 라벨
+            size_t v_label = targets_ptr[i]; // 외부 라벨
 
-        	// Lock만 잡고 즉시 삽입 (Lookup 생략)
-        	appr_alg->forcedInsertLayer0EdgeWithLock(u_internal, v_internal);
+            hnswlib::tableint u_internal, v_internal;
+
+            // 1. label_lookup_을 통해 외부 라벨을 내부 ID로 변환
+            {
+                std::unique_lock<std::mutex> lock(appr_alg->label_lookup_lock); //
+                auto it_u = appr_alg->label_lookup_.find(u_label);
+                auto it_v = appr_alg->label_lookup_.find(v_label);
+
+                // 라벨이 존재하지 않는 경우 스킵
+                if (it_u == appr_alg->label_lookup_.end() || it_v == appr_alg->label_lookup_.end()) {
+                    return;
+                }
+
+                u_internal = it_u->second;
+                v_internal = it_v->second;
+            }
+
+            // 2. 변환된 내부 ID(tableint)를 사용하여 에지 삽입
+            appr_alg->forcedInsertLayer0EdgeWithLock(u_internal, v_internal); //
         });
     }
 
