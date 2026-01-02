@@ -310,7 +310,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // 3. 엣지 추가 (메모리 버퍼 오버플로우 방지 체크 권장)
         // 생성자에서 (maxM0_) 만큼 할당했으므로, 이 범위를 넘지 않도록 안전장치 추가
         size_t allocated_size = maxM0_;
-        if (sz > allocated_size) {
+        if (sz >= allocated_size) {
             // 버퍼가 가득 찼다면 추가하지 않음 (혹은 에러 로그)
             return;
         }
