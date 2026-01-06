@@ -118,7 +118,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         update_probability_generator_.seed(random_seed + 1);
 
         // 각 노드마다 가지는 이웃 리스트의 크기
-        size_links_level0_ = (maxM0_) * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = (maxM0_ + 100) * sizeof(tableint) + sizeof(linklistsizeint);
         // 본인 + 이웃 크기인건가?
         size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
         offsetData_ = size_links_level0_;
@@ -308,8 +308,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         // 3. 엣지 추가 (메모리 버퍼 오버플로우 방지 체크 권장)
-        // 생성자에서 (maxM0_) 만큼 할당했으므로, 이 범위를 넘지 않도록 안전장치 추가
-        size_t allocated_size = maxM0_;
+        // 생성자에서 (maxM0_ + 100) 만큼 할당했으므로, 이 범위를 넘지 않도록 안전장치 추가
+        size_t allocated_size = maxM0_ + 100;
         if (sz >= allocated_size) {
             // 버퍼가 가득 찼다면 추가하지 않음 (혹은 에러 로그)
             return;
@@ -1162,7 +1162,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
         // 무제한 edge 추가를 위해 버퍼를 100으로 확장 (일단 rollback)
-        size_links_level0_ = (maxM0_) * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = (maxM0_ + 100) * sizeof(tableint) + sizeof(linklistsizeint);
         std::vector<std::mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
 
