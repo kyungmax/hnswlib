@@ -46,7 +46,8 @@ class RandomSelfTestCase(unittest.TestCase):
         # entry point에서 멀리 떨어진 query
         query = ep_vec + 100.0 * np.random.randn(dim).astype(np.float32)
 
-        trace = p.search_layer0_path(query, 10)
+        trace = p.search_layer0_path_with_dist_metrics_batch(query, 10)
+        print("Trace:", trace)
         layout = p.get_layer0_neighbors_with_distances()
         p.batch_insert_layer0_edges(0, 2, False)
         layout = p.get_layer0_neighbors_with_distances()

@@ -1255,7 +1255,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("num_threads") = -1
         )
         .def("search_layer0_path_with_dist_metrics_batch",
-            &Index<float>::searchLayer0PathBatch,
+            &Index<float>::searchLayer0PathBatchWithMetrics,
             py::arg("data"),
             py::arg("ef"),
             py::arg("num_threads") = -1
