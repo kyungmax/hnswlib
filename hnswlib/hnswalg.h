@@ -319,13 +319,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         setListCount(ll, sz + 1);
     }
 
-    std::vector<tableint>
+    std::pair<std::vector<tableint>, size_t>
     searchBaseLayerSTWithTrace(
         tableint ep_id,
         const void *data_point,
         size_t ef
     ) const {
         std::vector<tableint> path;
+        size_t dist_count = 0; // 거리 계산 카운터
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -340,6 +341,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         char* ep_data = getDataByInternalId(ep_id);
         dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
         dist_t lowerBound = dist;
+        dist_count++; // 카운트 증가
 
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
@@ -371,6 +373,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 char *currObj1 = getDataByInternalId(candidate_id);
                 dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                dist_count++; // 카운트 증가
 
                 if (top_candidates.size() < ef || lowerBound > dist) {
                     candidate_set.emplace(-dist, candidate_id);
@@ -385,20 +388,22 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return path;
+        return {path, dist_count}; // 경로와 카운트 함께 반환
     }
 
     // 전체 HNSW 검색 과정을 따르되, base layer의 path만 기록
-    std::vector<tableint>
+    std::pair<std::vector<tableint>, size_t>
     searchKnnWithLayer0Trace(
         const void *query_data,
         size_t ef
     ) const {
-        if (cur_element_count == 0) return std::vector<tableint>();
+        size_t total_dist_count = 0;
+        if (cur_element_count == 0) return {std::vector<tableint>(), 0};
 
         // 1. Top layer에서 시작 (실제 searchKnn과 동일)
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        total_dist_count++;
 
         // 2. 각 layer를 greedy search로 내려감 (layer maxlevel_ → 1)
         for (int level = maxlevel_; level > 0; level--) {
@@ -414,6 +419,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    total_dist_count++; // 카운트 증가
                     
                     if (d < curdist) {
                         curdist = d;
@@ -423,9 +429,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
+        // 3. Base layer 탐색 호출 및 카운트 합산
+        auto [path, base_dist_count] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
+        total_dist_count += base_dist_count;
 
-        // 3. 최종 entry point로 base layer 검색 + path 기록
-        return searchBaseLayerSTWithTrace(currObj, query_data, ef);
+        return {path, total_dist_count};
     }
 
     // ===== Adaptive Beam Search =====

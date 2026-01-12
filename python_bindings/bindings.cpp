@@ -190,6 +190,12 @@ class Index {
     }
 
 
+    // 결과와 메트릭을 함께 담는 구조체
+    struct SearchBatchResult {
+        std::vector<std::vector<hnswlib::labeltype>> paths;
+        size_t total_dist_count;
+    };
+
     void init_new_index(
         size_t maxElements,
         size_t M,
@@ -395,71 +401,87 @@ class Index {
         });
     }
 
-    /*
-     * [최적화] 배치 병렬 경로 탐색
-     * 쿼리셋을 통으로 받아 병렬로 search_layer0_path를 수행
-     * Returns: List[List[int]] (각 쿼리별 방문 노드 리스트의 리스트)
-     */
-    /*
- * [수정본] 배치 병렬 경로 탐색
- * 내부 ID(tableint) 대신 외부 라벨(labeltype)의 리스트를 반환하도록 변경
- */
-	py::object searchLayer0PathBatch(
-	    py::object input,
-	    size_t ef,
-    	int num_threads = -1
-	) {
-    	py::array_t < float, py::array::c_style | py::array::forcecast > items(input);
-    	auto buffer = items.request();
-    	size_t rows, features;
-    	get_input_array_shapes(buffer, &rows, &features);
+    // [API 1] 기존 API: 하위 호환성 유지 (항상 List[List[Label]]만 반환)
+    py::object searchLayer0PathBatch(
+        py::object input,
+        size_t ef,
+        int num_threads = -1
+    ) {
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
+        return py::cast(res.paths);
+    }
 
-    	if (num_threads <= 0) num_threads = num_threads_default;
+    // [API 2] 신규 API: 거리 계산 횟수 포함 (Tuple[List, int] 반환)
+    py::tuple searchLayer0PathBatchWithMetrics(
+        py::object input,
+        size_t ef,
+        int num_threads = -1
+    ) {
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
+        // Python에서 (results, total_dist_count) 형태의 튜플로 받게 됨
+        return py::make_tuple(res.paths, res.total_dist_count);
+    }
 
-    	// [변경] 결과 저장용 타입을 tableint에서 labeltype으로 변경
-    	std::vector<std::vector<hnswlib::labeltype>> results(rows);
 
-    	{
-        	// GIL 해제하여 병렬 처리 허용
-        	py::gil_scoped_release l;
+    SearchBatchResult _searchLayer0PathBatchInternal(
+        py::object input,
+        size_t ef,
+        int num_threads
+    ) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
 
-        	if (normalize == false) {
-            	ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                	// 1. 내부 ID 경로 탐색 수행
-                	std::vector<hnswlib::tableint> path_internal = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
+        if (num_threads <= 0) num_threads = num_threads_default;
 
-                	// 2. 내부 ID를 외부 라벨로 변환하여 결과 벡터에 저장
-                	std::vector<hnswlib::labeltype> path_labels;
-                	path_labels.reserve(path_internal.size());
-                	for (auto id : path_internal) {
-	                    path_labels.push_back(appr_alg->getExternalLabel(id));
-    	            }
-        	        results[row] = std::move(path_labels);
-            	});
-        	} else {
-            	// Cosine 유사도 등을 위한 정규화 처리
-            	std::vector<float> norm_array(num_threads * features);
-            	ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                	size_t start_idx = threadId * dim;
-                	normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+        std::vector<std::vector<hnswlib::labeltype>> results(rows);
+        std::vector<size_t> dist_counts(rows, 0); // 스레드 간 경합 방지를 위해 개별 저장
 
-                	// 1. 내부 ID 경로 탐색 수행
-                	std::vector<hnswlib::tableint> path_internal = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
+        {
+            py::gil_scoped_release l;
 
-                	// 2. 내부 ID를 외부 라벨로 변환
-                	std::vector<hnswlib::labeltype> path_labels;
-                	path_labels.reserve(path_internal.size());
-                	for (auto id : path_internal) {
-                    	path_labels.push_back(appr_alg->getExternalLabel(id));
-                	}
-                	results[row] = std::move(path_labels);
-            	});
-        	}
-    	}
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    // 1. 경로와 거리 계산 횟수 획득
+                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
+                    dist_counts[row] = count;
 
-	    // [결과] 이제 Python은 항상 Label 리스트의 리스트를 받게 됨
-	    return py::cast(results);
-	}
+                    // 2. 내부 ID -> 외부 라벨 변환
+                    std::vector<hnswlib::labeltype> path_labels;
+                    path_labels.reserve(path_internal.size());
+                    for (auto id : path_internal) {
+                        path_labels.push_back(appr_alg->getExternalLabel(id));
+                    }
+                    results[row] = std::move(path_labels);
+                });
+            } else {
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * features; // dim 대신 features 사용 (안전성)
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    // 1. 경로와 거리 계산 횟수 획득
+                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
+                    dist_counts[row] = count;
+
+                    // 2. 내부 ID -> 외부 라벨 변환
+                    std::vector<hnswlib::labeltype> path_labels;
+                    path_labels.reserve(path_internal.size());
+                    for (auto id : path_internal) {
+                        path_labels.push_back(appr_alg->getExternalLabel(id));
+                    }
+                    results[row] = std::move(path_labels);
+                });
+            }
+        }
+
+        // 모든 row의 거리 계산 횟수 총합 계산
+        size_t total_count = 0;
+        for (size_t c : dist_counts) total_count += c;
+
+        return {std::move(results), total_count};
+    }
 
     py::object knnQueryAdaptive(
         py::object input,
@@ -1227,6 +1249,12 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("num_threads") = -1
         )
         .def("search_layer0_path_batch",
+            &Index<float>::searchLayer0PathBatch,
+            py::arg("data"),
+            py::arg("ef"),
+            py::arg("num_threads") = -1
+        )
+        .def("search_layer0_path_with_dist_metrics_batch",
             &Index<float>::searchLayer0PathBatch,
             py::arg("data"),
             py::arg("ef"),
