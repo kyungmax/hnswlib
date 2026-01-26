@@ -9,6 +9,7 @@
 #include <atomic>
 #include <stdlib.h>
 #include <assert.h>
+#include <omp.h>
 
 namespace py = pybind11;
 using namespace pybind11::literals;  // needed to bring in _a literal
@@ -333,6 +334,49 @@ class Index {
     	}
     	return py::cast(adj_labels);
 	}
+
+    std::pair<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>> getLayer0EdgesParallel() {
+        // 1. 내부 인접 리스트 가져오기 (이미 구현된 내부 함수 가정)
+        auto const& nodes_internal = appr_alg->getLayer0NeighborsWithDistances();
+        size_t num_nodes = nodes_internal.size();
+
+        // 2. 전체 에지 개수 계산 및 오프셋 사전 계산 (Prefix Sum)
+        std::vector<size_t> offsets(num_nodes + 1, 0);
+        std::vector<hnswlib::tableint> internal_ids;
+        internal_ids.reserve(num_nodes);
+
+        size_t idx = 0;
+        for (auto const& [u_int, nbrs] : nodes_internal) {
+            internal_ids.push_back(u_int);
+            offsets[idx + 1] = offsets[idx] + nbrs.size();
+            idx++;
+        }
+        size_t total_edges = offsets[num_nodes];
+
+        // 3. 반환할 NumPy 배열 할당
+        py::array_t<hnswlib::labeltype> sources(total_edges);
+        py::array_t<hnswlib::labeltype> targets(total_edges);
+        auto src_ptr = sources.mutable_data();
+        auto tgt_ptr = targets.mutable_data();
+
+        // 4. OpenMP 병렬 처리: Label 변환 및 배열 채우기
+        #pragma omp parallel for
+        for (int i = 0; i < (int)num_nodes; ++i) {
+            hnswlib::tableint u_int = internal_ids[i];
+            hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_int);
+
+            size_t current_offset = offsets[i];
+            auto const& nbrs = nodes_internal.at(u_int);
+
+            for (size_t j = 0; j < nbrs.size(); ++j) {
+                src_ptr[current_offset + j] = u_label;
+                tgt_ptr[current_offset + j] = appr_alg->getExternalLabel(nbrs[j].first);
+            }
+        }
+
+        return {sources, targets};
+    }
+
 
     void forcedInsertLayer0Edge(
         size_t from,
@@ -1212,6 +1256,9 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("replace_deleted") = false)
         .def("get_layer0_neighbors_with_distances",
             &Index<float>::getLayer0NeighborsWithDistances
+        )
+        .def("get_layer0_edges_parallel",
+            &Index<float>::getLayer0EdgesParallel
         )
         .def("forced_insert_layer0_edge",
             &Index<float>::forcedInsertLayer0Edge,
