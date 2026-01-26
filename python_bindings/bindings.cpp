@@ -335,12 +335,12 @@ class Index {
     	return py::cast(adj_labels);
 	}
 
-    std::pair<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>> getLayer0EdgesParallel() {
-        // 1. 내부 인접 리스트 가져오기 (이미 구현된 내부 함수 가정)
+    std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
+        getLayer0EdgesParallel() {
         auto const& nodes_internal = appr_alg->getLayer0NeighborsWithDistances();
         size_t num_nodes = nodes_internal.size();
 
-        // 2. 전체 에지 개수 계산 및 오프셋 사전 계산 (Prefix Sum)
+        // 1. 오프셋 및 내부 ID 목록 준비
         std::vector<size_t> offsets(num_nodes + 1, 0);
         std::vector<hnswlib::tableint> internal_ids;
         internal_ids.reserve(num_nodes);
@@ -353,13 +353,16 @@ class Index {
         }
         size_t total_edges = offsets[num_nodes];
 
-        // 3. 반환할 NumPy 배열 할당
+        // 2. NumPy 배열 할당 (Source, Target, Distance)
         py::array_t<hnswlib::labeltype> sources(total_edges);
         py::array_t<hnswlib::labeltype> targets(total_edges);
+        py::array_t<float> distances(total_edges);
+
         auto src_ptr = sources.mutable_data();
         auto tgt_ptr = targets.mutable_data();
+        auto dist_ptr = distances.mutable_data();
 
-        // 4. OpenMP 병렬 처리: Label 변환 및 배열 채우기
+        // 3. OpenMP 병렬 처리: 모든 정보를 한 번에 평탄화
         #pragma omp parallel for
         for (int i = 0; i < (int)num_nodes; ++i) {
             hnswlib::tableint u_int = internal_ids[i];
@@ -369,12 +372,14 @@ class Index {
             auto const& nbrs = nodes_internal.at(u_int);
 
             for (size_t j = 0; j < nbrs.size(); ++j) {
-                src_ptr[current_offset + j] = u_label;
-                tgt_ptr[current_offset + j] = appr_alg->getExternalLabel(nbrs[j].first);
+                size_t target_idx = current_offset + j;
+                src_ptr[target_idx] = u_label;
+                tgt_ptr[target_idx] = appr_alg->getExternalLabel(nbrs[j].first);
+                dist_ptr[target_idx] = nbrs[j].second; // 거리 정보 추가
             }
         }
 
-        return {sources, targets};
+        return std::make_tuple(sources, targets, distances);
     }
 
 
