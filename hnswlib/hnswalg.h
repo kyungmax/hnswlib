@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <omp.h>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -232,31 +233,50 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     // ===== Layer0 full adjacency with distances (UNSAFE, read-only) =====
     // Returns: map[node_id] -> vector of (neighbor_id, distance)
+
     std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>
-    getLayer0NeighborsWithDistances() const {
+getLayer0NeighborsWithDistances() const {
         std::unordered_map<tableint, std::vector<std::pair<tableint, float>>> adj;
         adj.reserve(cur_element_count);
 
-        for (tableint u = 0; u < cur_element_count; u++) {
-            if (isMarkedDeleted(u)) continue;
+        // 스레드별로 결과를 담을 임시 벡터 (Lock 경합 방지)
+        std::vector<std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>> local_adjs(omp_get_max_threads());
 
-            linklistsizeint* ll = get_linklist0(u);
-            size_t sz = getListCount(ll);
-            tableint* data = (tableint*)(ll + 1);
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            local_adjs[tid].reserve(cur_element_count / omp_get_num_threads());
 
-            std::vector<std::pair<tableint, float>> nbrs;
-            nbrs.reserve(sz);
+#pragma omp for schedule(dynamic, 64)
+            for (int u_idx = 0; u_idx < (int)cur_element_count; u_idx++) {
+                tableint u = (tableint)u_idx;
+                if (isMarkedDeleted(u)) continue;
 
-            char* u_data = getDataByInternalId(u);
+                linklistsizeint* ll = get_linklist0(u);
+                size_t sz = getListCount(ll);
+                tableint* data = (tableint*)(ll + 1);
 
-            for (size_t i = 0; i < sz; i++) {
-                tableint v = data[i];
-                char* v_data = getDataByInternalId(v);
-                float d = (float) fstdistfunc_(u_data, v_data, dist_func_param_);
-                nbrs.emplace_back(v, d);
+                std::vector<std::pair<tableint, float>> nbrs;
+                nbrs.reserve(sz);
+
+                char* u_data = getDataByInternalId(u);
+
+                for (size_t i = 0; i < sz; i++) {
+                    tableint v = data[i];
+                    char* v_data = getDataByInternalId(v);
+                    // 무거운 거리 계산을 병렬로 수행
+                    float d = (float)fstdistfunc_(u_data, v_data, dist_func_param_);
+                    nbrs.emplace_back(v, d);
+                }
+
+                local_adjs[tid].emplace(u, std::move(nbrs));
             }
+        }
 
-            adj.emplace(u, std::move(nbrs));
+        // 각 스레드의 결과를 하나로 병합 (이 부분은 순차적이지만 매우 빠름)
+        for (auto& local_map : local_adjs) {
+            adj.insert(std::make_move_iterator(local_map.begin()),
+                       std::make_move_iterator(local_map.end()));
         }
 
         return adj;
