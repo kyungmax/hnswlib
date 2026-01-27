@@ -335,54 +335,63 @@ class Index {
     	return py::cast(adj_labels);
 	}
 
-    std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
-    getLayer0EdgesParallel() {
-        auto const& nodes_internal = appr_alg->getLayer0NeighborsWithDistances();
-        size_t num_nodes = nodes_internal.size();
+	std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
+	getLayer0EdgesParallel() {
+    	size_t num_nodes = appr_alg->cur_element_count;
 
-        // 1. 오프셋 및 내부 ID 목록 준비
-        std::vector<size_t> offsets(num_nodes + 1, 0);
-        std::vector<hnswlib::tableint> internal_ids;
-        internal_ids.reserve(num_nodes);
+    	// 1. 각 노드의 엣지 개수를 파악하여 오프셋 계산 (이 부분은 가벼움)
+    	std::vector<size_t> offsets(num_nodes + 1, 0);
+    	for (size_t i = 0; i < num_nodes; ++i) {
+        	if (appr_alg->isMarkedDeleted(i)) {
+            	offsets[i + 1] = offsets[i];
+            	continue;
+        	}
+        	offsets[i + 1] = offsets[i] + appr_alg->getListCount(appr_alg->get_linklist0(i));
+    	}
+    	size_t total_edges = offsets[num_nodes];
 
-        size_t idx = 0;
-        for (auto const& [u_int, nbrs] : nodes_internal) {
-            internal_ids.push_back(u_int);
-            offsets[idx + 1] = offsets[idx] + nbrs.size();
-            idx++;
-        }
-        size_t total_edges = offsets[num_nodes];
+    	// 2. 결과 배열 할당
+    	py::array_t<hnswlib::labeltype> sources(total_edges);
+    	py::array_t<hnswlib::labeltype> targets(total_edges);
+    	py::array_t<float> distances(total_edges);
 
-        // 2. NumPy 배열 할당
-        py::array_t<hnswlib::labeltype> sources(total_edges);
-        py::array_t<hnswlib::labeltype> targets(total_edges);
-        py::array_t<float> distances(total_edges);
+    	auto src_ptr = sources.mutable_data();
+    	auto tgt_ptr = targets.mutable_data();
+    	auto dist_ptr = distances.mutable_data();
 
-        auto src_ptr = sources.mutable_data();
-        auto tgt_ptr = targets.mutable_data();
-        auto dist_ptr = distances.mutable_data();
+    	// 3. 진정한 병렬 처리: 거리 계산과 배열 채우기를 동시에 수행
+    	{
+        	py::gil_scoped_release l;
+        	ParallelFor(0, num_nodes, num_threads_default, [&](size_t u, size_t threadId) {
+            	if (appr_alg->isMarkedDeleted(u)) return;
 
-        // 3. GIL 해제 및 ParallelFor 실행
-        {
-            py::gil_scoped_release l; // Python GIL을 해제하여 진정한 병렬 처리 가능케 함
-            ParallelFor(0, num_nodes, num_threads_default, [&](size_t i, size_t threadId) {
-                hnswlib::tableint u_int = internal_ids[i];
-                hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_int);
+            	hnswlib::labeltype u_label = appr_alg->getExternalLabel(u);
+            	char* u_data = appr_alg->getDataByInternalId(u);
 
-                size_t current_offset = offsets[i];
-                auto const& nbrs = nodes_internal.at(u_int);
+            	hnswlib::linklistsizeint* ll = appr_alg->get_linklist0(u);
+            	size_t sz = appr_alg->getListCount(ll);
+            	hnswlib::tableint* neighbors = (hnswlib::tableint*)(ll + 1);
 
-                for (size_t j = 0; j < nbrs.size(); ++j) {
-                    size_t target_idx = current_offset + j;
-                    src_ptr[target_idx] = u_label;
-                    tgt_ptr[target_idx] = appr_alg->getExternalLabel(nbrs[j].first);
-                    dist_ptr[target_idx] = nbrs[j].second;
-                }
-            });
-        }
+            	size_t start_idx = offsets[u];
+            	for (size_t j = 0; j < sz; j++) {
+                	hnswlib::tableint v = neighbors[j];
+                	size_t write_pos = start_idx + j;
 
-        return std::make_tuple(sources, targets, distances);
-    }
+                	src_ptr[write_pos] = u_label;
+                	tgt_ptr[write_pos] = appr_alg->getExternalLabel(v);
+
+                	// 거리 계산을 여기서 병렬로 수행!
+                	dist_ptr[write_pos] = (float)appr_alg->fstdistfunc_(
+                    	u_data,
+                    	appr_alg->getDataByInternalId(v),
+                    	appr_alg->dist_func_param_
+                	);
+            	}
+        	});
+    	}
+
+    	return std::make_tuple(sources, targets, distances);
+	}
 
 
     void forcedInsertLayer0Edge(
