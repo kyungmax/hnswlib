@@ -336,7 +336,7 @@ class Index {
 	}
 
     std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
-        getLayer0EdgesParallel() {
+    getLayer0EdgesParallel() {
         auto const& nodes_internal = appr_alg->getLayer0NeighborsWithDistances();
         size_t num_nodes = nodes_internal.size();
 
@@ -353,7 +353,7 @@ class Index {
         }
         size_t total_edges = offsets[num_nodes];
 
-        // 2. NumPy 배열 할당 (Source, Target, Distance)
+        // 2. NumPy 배열 할당
         py::array_t<hnswlib::labeltype> sources(total_edges);
         py::array_t<hnswlib::labeltype> targets(total_edges);
         py::array_t<float> distances(total_edges);
@@ -362,21 +362,23 @@ class Index {
         auto tgt_ptr = targets.mutable_data();
         auto dist_ptr = distances.mutable_data();
 
-        // 3. OpenMP 병렬 처리: 모든 정보를 한 번에 평탄화
-        #pragma omp parallel for
-        for (int i = 0; i < (int)num_nodes; ++i) {
-            hnswlib::tableint u_int = internal_ids[i];
-            hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_int);
+        // 3. GIL 해제 및 ParallelFor 실행
+        {
+            py::gil_scoped_release l; // Python GIL을 해제하여 진정한 병렬 처리 가능케 함
+            ParallelFor(0, num_nodes, num_threads_default, [&](size_t i, size_t threadId) {
+                hnswlib::tableint u_int = internal_ids[i];
+                hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_int);
 
-            size_t current_offset = offsets[i];
-            auto const& nbrs = nodes_internal.at(u_int);
+                size_t current_offset = offsets[i];
+                auto const& nbrs = nodes_internal.at(u_int);
 
-            for (size_t j = 0; j < nbrs.size(); ++j) {
-                size_t target_idx = current_offset + j;
-                src_ptr[target_idx] = u_label;
-                tgt_ptr[target_idx] = appr_alg->getExternalLabel(nbrs[j].first);
-                dist_ptr[target_idx] = nbrs[j].second; // 거리 정보 추가
-            }
+                for (size_t j = 0; j < nbrs.size(); ++j) {
+                    size_t target_idx = current_offset + j;
+                    src_ptr[target_idx] = u_label;
+                    tgt_ptr[target_idx] = appr_alg->getExternalLabel(nbrs[j].first);
+                    dist_ptr[target_idx] = nbrs[j].second;
+                }
+            });
         }
 
         return std::make_tuple(sources, targets, distances);
