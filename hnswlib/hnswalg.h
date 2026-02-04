@@ -111,7 +111,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             M_ = 10000;
         }
         maxM_ = M_;
-        maxM0_ = M_ * 2;
+        maxM0_ = M_ * 2 + 1;
         ef_construction_ = std::max(ef_construction, M_);
         ef_ = 10;
 
