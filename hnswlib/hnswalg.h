@@ -387,6 +387,7 @@ getLayer0NeighborsWithDistances() const {
             if (!top_candidates.empty()) {
                 // top_candidates는 max-heap이므로 top()이 가장 먼(furthest) 요소임
                 tableint furthest_id = top_candidates.top().second;
+                step.internal_dist = (float)top_candidates.top().first;
                 float* vec_ptr = (float*)getDataByInternalId(furthest_id);
                 step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
             }
