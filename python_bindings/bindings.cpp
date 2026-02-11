@@ -496,11 +496,15 @@ class Index {
         std::vector<size_t> dist_counts(rows, 0);
 
         {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize(num_threads * features);
+            }
+
             py::gil_scoped_release l; // GIL 해제: 이제부터 Python 객체 조작 금지
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                 const float* query_ptr = (const float*)items.data(row);
                 if (normalize) {
-                    std::vector<float> norm_array(num_threads * features);
                     size_t start_idx = threadId * features;
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
                     query_ptr = norm_array.data() + start_idx;
