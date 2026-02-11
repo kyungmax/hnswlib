@@ -574,8 +574,8 @@ class Index {
             // v.erase(std::remove(v.begin(), v.end(), 0.0f), v.end());
 
             if (!v.empty()) {
-                size_t low_idx = static_cast<size_t>(v.size() * lid_low_p);
-                size_t high_idx = static_cast<size_t>(v.size() * lid_high_p);
+                size_t low_idx = static_cast<size_t>(v.size() * lid_low);
+                size_t high_idx = static_cast<size_t>(v.size() * lid_high);
 
                 // 하위 임계값 추출 (O(N))
                 std::nth_element(v.begin(), v.begin() + low_idx, v.end());
