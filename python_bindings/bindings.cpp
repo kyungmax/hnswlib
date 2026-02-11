@@ -553,10 +553,17 @@ class Index {
     py::object knnQueryAdaptive(
         py::object input,
         size_t k = 1,
-        size_t ef_init = 20,
-        size_t ef_max = 200,
-        float delta_thr = 0.01,
-        size_t window = 5,
+        size_t ef_init = 128,
+        size_t ef_max = 1024,
+        size_t ef_min = 64,
+        size_t tmin_pops = 30,
+        size_t lid_window_k = 8,
+        size_t stall_window_w = 8,
+        float lid_low = 0.0,
+        float lid_high = 0.0,
+        float dist_low = 0.0,
+        float dist_high = 0.0,
+        bool enable_down = false,
         int num_threads = -1
     ) {
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
@@ -564,58 +571,40 @@ class Index {
         size_t rows, features;
         get_input_array_shapes(buffer, &rows, &features);
 
-        if (features != (size_t)dim)
-            throw std::runtime_error("Wrong dimensionality of the vectors");
-
         if (num_threads <= 0) num_threads = num_threads_default;
-        if (rows <= (size_t)num_threads * 4) num_threads = 1;
 
         hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
         dist_t* data_numpy_d = new dist_t[rows * k];
 
-        // init with "empty"
-        for (size_t i = 0; i < rows * k; i++) {
-            data_numpy_l[i] = (hnswlib::labeltype)(-1);
-            data_numpy_d[i] = std::numeric_limits<dist_t>::infinity();
-        }
+        {
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                std::vector<float> norm_query;
+                if (normalize) {
+                    norm_query.resize(dim);
+                    normalize_vector((float*)items.data(row), norm_query.data());
+                    query_ptr = norm_query.data();
+                }
 
-        py::gil_scoped_release l;
-
-        ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-            // Prepare query pointer (normalize if cosine)
-            const float* query_ptr = (const float*)items.data(row);
-            std::vector<float> norm_query;
-            if (normalize) {
-                norm_query.resize(dim);
-                normalize_vector((float*)items.data(row), norm_query.data());
-                query_ptr = norm_query.data();
-            }
-
-            hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
-            if (ep < 0 || ep >= appr_alg->cur_element_count)
-                throw std::runtime_error("Invalid base-layer entry");
-
-            std::priority_queue<std::pair<dist_t, hnswlib::labeltype>> result =
-                appr_alg->searchBaseLayerAdaptive(
-                    ep,
-                    (const void*)query_ptr,
-                    k,
-                    ef_init,
-                    ef_max,
-                    delta_thr,
-                    window
+                hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
+                auto result = appr_alg->searchBaseLayerAdaptive(
+                    ep, query_ptr, k,
+                    ef_init, ef_max, ef_min,
+                    tmin_pops, lid_window_k, stall_window_w,
+                    lid_low, lid_high, dist_low, dist_high,
+                    enable_down
                 );
 
-            // Fill output in ascending distance order (same as knn_query)
-            for (int i = (int)k - 1; i >= 0; i--) {
-                if (!result.empty()) {
-                    auto &tup = result.top();
-                    data_numpy_d[row * k + (size_t)i] = tup.first;
-                    data_numpy_l[row * k + (size_t)i] = tup.second;
-                    result.pop();
+                for (int i = (int)k - 1; i >= 0; i--) {
+                    if (!result.empty()) {
+                        data_numpy_d[row * k + i] = result.top().first;
+                        data_numpy_l[row * k + i] = result.top().second;
+                        result.pop();
+                    }
                 }
-            }
-        });
+            });
+        }
 
         py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
         py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
@@ -636,6 +625,23 @@ class Index {
         );
     }
 
+    void calcLidsInternal(size_t k_lid, int num_threads = -1) {
+        if (!appr_alg) throw std::runtime_error("Index not initialized");
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        size_t n = appr_alg->cur_element_count;
+        appr_alg->node_lid_.assign(appr_alg->max_elements_, 0.0f); // 공간 확보
+
+        {
+            py::gil_scoped_release l; // 검색 연산을 위해 GIL 해제
+            ParallelFor(0, n, num_threads, [&](size_t i, size_t threadId) {
+                // 삭제된 노드가 아니라면 LID 계산 수행
+                if (!appr_alg->isMarkedDeleted((hnswlib::tableint)i)) {
+                    appr_alg->calcNodeLidInternal((hnswlib::tableint)i, k_lid);
+                }
+            });
+        }
+    }
 
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
@@ -1265,11 +1271,23 @@ PYBIND11_PLUGIN(hnswlib) {
             &Index<float>::knnQueryAdaptive,
             py::arg("data"),
             py::arg("k") = 1,
-            py::arg("ef_init") = 20,
-            py::arg("ef_max") = 200,
-            py::arg("delta_thr") = 0.01,
-            py::arg("window") = 5,
+            py::arg("ef_init") = 128,
+            py::arg("ef_max") = 1024,
+            py::arg("ef_min") = 64,
+            py::arg("tmin_pops") = 30,
+            py::arg("lid_window_k") = 8,
+            py::arg("stall_window_w") = 8,
+            py::arg("lid_low") = 0.0,
+            py::arg("lid_high") = 0.0,
+            py::arg("dist_low") = 0.0,
+            py::arg("dist_high") = 0.0,
+            py::arg("enable_down") = false,
             py::arg("num_threads") = -1
+        )
+        .def("calc_lids_internal", &Index<float>::calcLidsInternal,
+            py::arg("k_lid"),
+            py::arg("num_threads") = -1,
+            "Calculate LID for all nodes internally using k-NN search"
         )
         .def("add_items",
             &Index<float>::addItems,
