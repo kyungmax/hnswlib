@@ -559,13 +559,33 @@ class Index {
         size_t tmin_pops = 30,
         size_t lid_window_k = 8,
         size_t stall_window_w = 8,
-        float lid_low = 0.0,
-        float lid_high = 0.0,
+        float lid_low = 0.3,
+        float lid_high = 0.7,
         float dist_low = 0.0,
         float dist_high = 0.0,
         bool enable_down = false,
         int num_threads = -1
     ) {
+        float actual_lid_low = 0.0f;
+        float actual_lid_high = 0.0f;
+        if (!appr_alg->node_lid_.empty()) {
+            std::vector<float> v = appr_alg->node_lid_; // 복사본 생성 (std::nth_element용)
+            // 0이 아닌 유효한 LID들만 모음 (필요 시)
+            // v.erase(std::remove(v.begin(), v.end(), 0.0f), v.end());
+
+            if (!v.empty()) {
+                size_t low_idx = static_cast<size_t>(v.size() * lid_low_p);
+                size_t high_idx = static_cast<size_t>(v.size() * lid_high_p);
+
+                // 하위 임계값 추출 (O(N))
+                std::nth_element(v.begin(), v.begin() + low_idx, v.end());
+                actual_lid_low = v[low_idx];
+
+                // 상위 임계값 추출
+                std::nth_element(v.begin(), v.begin() + high_idx, v.end());
+                actual_lid_high = v[high_idx];
+            }
+        }
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
         auto buffer = items.request();
         size_t rows, features;
@@ -592,7 +612,7 @@ class Index {
                     ep, query_ptr, k,
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
-                    lid_low, lid_high, dist_low, dist_high,
+                    actual_lid_low, actual_lid_high, dist_low, dist_high,
                     enable_down
                 );
 
@@ -1277,8 +1297,8 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("tmin_pops") = 30,
             py::arg("lid_window_k") = 8,
             py::arg("stall_window_w") = 8,
-            py::arg("lid_low") = 0.0,
-            py::arg("lid_high") = 0.0,
+            py::arg("lid_low") = 0.3,
+            py::arg("lid_high") = 0.7,
             py::arg("dist_low") = 0.0,
             py::arg("dist_high") = 0.0,
             py::arg("enable_down") = false,
