@@ -523,7 +523,7 @@ class Index {
                 py::dict d;
                 d["node_label"] = appr_alg->getExternalLabel(s.node_id);
                 d["rs_size"] = s.result_set_size;
-
+                d["internal_dist"] = s.internal_dist;
                 // C++ vector를 numpy array로 변환
                 d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
                 py_steps.push_back(d);
