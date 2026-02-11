@@ -12,7 +12,6 @@
 #include <omp.h>
 
 namespace hnswlib {
-typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
 template<typename dist_t>
@@ -339,14 +338,15 @@ getLayer0NeighborsWithDistances() const {
         setListCount(ll, sz + 1);
     }
 
-    std::pair<std::vector<tableint>, size_t>
+    std::pair<std::vector<SearchStepInfo>, size_t>
     searchBaseLayerSTWithTrace(
         tableint ep_id,
         const void *data_point,
         size_t ef
     ) const {
-        std::vector<tableint> path;
+        std::vector<SearchStepInfo> path_info;
         size_t dist_count = 0; // 거리 계산 카운터
+        size_t dim = *((size_t *) dist_func_param_); // 벡터 차원 획득
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -380,7 +380,17 @@ getLayer0NeighborsWithDistances() const {
             tableint current_node_id = current_node_pair.second;
 
             // ✅ Record popped node only in path for trace
-            path.push_back(current_node_id);
+            SearchStepInfo step;
+            step.node_id = current_node_id;
+            step.result_set_size = top_candidates.size();
+
+            if (!top_candidates.empty()) {
+                // top_candidates는 max-heap이므로 top()이 가장 먼(furthest) 요소임
+                tableint furthest_id = top_candidates.top().second;
+                float* vec_ptr = (float*)getDataByInternalId(furthest_id);
+                step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
+            }
+            path_info.push_back(std::move(step));
 
             int *data = (int *) get_linklist0(current_node_id);
             size_t size = getListCount((linklistsizeint*)data);
@@ -408,24 +418,23 @@ getLayer0NeighborsWithDistances() const {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return {path, dist_count}; // 경로와 카운트 함께 반환
+        return {path_info, dist_count}; // 경로와 카운트 함께 반환
     }
 
     // 전체 HNSW 검색 과정을 따르되, base layer의 path만 기록
-    std::pair<std::vector<tableint>, size_t>
+    std::pair<std::vector<SearchStepInfo>, size_t>
     searchKnnWithLayer0Trace(
         const void *query_data,
         size_t ef
     ) const {
         size_t total_dist_count = 0;
-        if (cur_element_count == 0) return {std::vector<tableint>(), 0};
+        if (cur_element_count == 0) return {std::vector<SearchStepInfo>(), 0};
 
-        // 1. Top layer에서 시작 (실제 searchKnn과 동일)
+        // 1. Top layer → Layer 1 탐색 (Greedy)
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
         total_dist_count++;
 
-        // 2. 각 layer를 greedy search로 내려감 (layer maxlevel_ → 1)
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
             while (changed) {
@@ -433,14 +442,12 @@ getLayer0NeighborsWithDistances() const {
                 unsigned int *data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
                 tableint *datal = (tableint *) (data + 1);
-                
+
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
-                    if (cand < 0 || cand > max_elements_)
-                        throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-                    total_dist_count++; // 카운트 증가
-                    
+                    total_dist_count++;
+
                     if (d < curdist) {
                         curdist = d;
                         currObj = cand;
@@ -449,11 +456,13 @@ getLayer0NeighborsWithDistances() const {
                 }
             }
         }
-        // 3. Base layer 탐색 호출 및 카운트 합산
-        auto [path, base_dist_count] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
+
+        // 2. Base layer 탐색 (상세 정보 포함)
+        // searchBaseLayerSTWithTrace는 이미 std::vector<SearchStepInfo>를 반환하도록 작성됨
+        auto [path_info, base_dist_count] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
         total_dist_count += base_dist_count;
 
-        return {path, total_dist_count};
+        return {path_info, total_dist_count};
     }
 
     // ===== Adaptive Beam Search =====
