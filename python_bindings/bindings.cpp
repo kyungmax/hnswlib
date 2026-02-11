@@ -193,8 +193,14 @@ class Index {
 
     // 결과와 메트릭을 함께 담는 구조체
     struct SearchBatchResult {
-        std::vector<std::vector<hnswlib::labeltype>> paths;
+        py::object paths;
         size_t total_dist_count;
+    };
+
+    struct PathInfo {
+        hnswlib::labeltype pathNode;
+        int resultSetSize;
+
     };
 
     void init_new_index(
@@ -459,7 +465,7 @@ class Index {
         int num_threads = -1
     ) {
         SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
-        return py::cast(res.paths);
+        return res.paths;
     }
 
     // [API 2] 신규 API: 거리 계산 횟수 포함 (Tuple[List, int] 반환)
@@ -486,52 +492,49 @@ class Index {
 
         if (num_threads <= 0) num_threads = num_threads_default;
 
-        std::vector<std::vector<hnswlib::labeltype>> results(rows);
-        std::vector<size_t> dist_counts(rows, 0); // 스레드 간 경합 방지를 위해 개별 저장
+        std::vector<std::vector<hnswlib::SearchStepInfo>> raw_results(rows);
+        std::vector<size_t> dist_counts(rows, 0);
 
         {
-            py::gil_scoped_release l;
-
-            if (normalize == false) {
-                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                    // 1. 경로와 거리 계산 횟수 획득
-                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
-                    dist_counts[row] = count;
-
-                    // 2. 내부 ID -> 외부 라벨 변환
-                    std::vector<hnswlib::labeltype> path_labels;
-                    path_labels.reserve(path_internal.size());
-                    for (auto id : path_internal) {
-                        path_labels.push_back(appr_alg->getExternalLabel(id));
-                    }
-                    results[row] = std::move(path_labels);
-                });
-            } else {
-                std::vector<float> norm_array(num_threads * features);
-                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                    size_t start_idx = threadId * features; // dim 대신 features 사용 (안전성)
+            py::gil_scoped_release l; // GIL 해제: 이제부터 Python 객체 조작 금지
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    std::vector<float> norm_array(num_threads * features);
+                    size_t start_idx = threadId * features;
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
 
-                    // 1. 경로와 거리 계산 횟수 획득
-                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
-                    dist_counts[row] = count;
+                // C++ 구조체로 결과 수집
+                auto [steps, count] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef);
+                raw_results[row] = std::move(steps);
+                dist_counts[row] = count;
+            });
+        } // gil_scoped_release 소멸 시 GIL 자동 재획득
 
-                    // 2. 내부 ID -> 외부 라벨 변환
-                    std::vector<hnswlib::labeltype> path_labels;
-                    path_labels.reserve(path_internal.size());
-                    for (auto id : path_internal) {
-                        path_labels.push_back(appr_alg->getExternalLabel(id));
-                    }
-                    results[row] = std::move(path_labels);
-                });
+        // 2단계: 메인 스레드에서 Python 객체로 변환 (GIL 확보 상태)
+        std::vector<std::vector<py::dict>> py_results(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            std::vector<py::dict> py_steps;
+            py_steps.reserve(raw_results[i].size());
+
+            for (auto& s : raw_results[i]) {
+                py::dict d;
+                d["node_label"] = appr_alg->getExternalLabel(s.node_id);
+                d["rs_size"] = s.result_set_size;
+
+                // C++ vector를 numpy array로 변환
+                d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
+                py_steps.push_back(d);
             }
+            py_results[i] = std::move(py_steps);
         }
 
-        // 모든 row의 거리 계산 횟수 총합 계산
         size_t total_count = 0;
         for (size_t c : dist_counts) total_count += c;
 
-        return {std::move(results), total_count};
+        return {py::cast(std::move(py_results)), total_count};
     }
 
     py::object knnQueryAdaptive(
@@ -1273,29 +1276,32 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("to"),
             py::arg("bidirectional") = false
         )
-        .def(
-            "search_layer0_path",
-            [](Index<float>& index,
-             py::array_t<float> query,
-             size_t ef) {
-              auto buf = query.request();
-              float* query_data = (float*)buf.ptr;
-              
-              // cosine space인 경우 정규화 필요
-              std::vector<float> normalized_query;
-              if (index.normalize) {
-                  normalized_query.resize(index.dim);
-                  index.normalize_vector(query_data, normalized_query.data());
-                  query_data = normalized_query.data();
-              }
-              
-              // ✅ 전체 HNSW 검색 과정을 따르며 base layer path 기록
-              return index.appr_alg->searchKnnWithLayer0Trace(
-                  query_data,
-                  ef
-              );
+    .def("search_layer0_path",
+            [](Index<float>& index, py::array_t<float> query, size_t ef) {
+                auto buf = query.request();
+                float* query_data = (float*)buf.ptr;
+
+                if (index.normalize) {
+                    std::vector<float> normalized_query(index.dim);
+                    index.normalize_vector(query_data, normalized_query.data());
+                    query_data = normalized_query.data();
+                }
+
+                // C++ 결과 획득
+                auto [steps, count] = index.appr_alg->searchKnnWithLayer0Trace(query_data, ef);
+
+                // Python Dict 리스트로 변환 (GIL이 잡혀있는 상태이므로 안전함)
+                std::vector<py::dict> py_steps;
+                for (auto& s : steps) {
+                    py::dict d;
+                    d["node_label"] = index.appr_alg->getExternalLabel(s.node_id);
+                    d["rs_size"] = s.result_set_size;
+                    d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
+                    py_steps.push_back(d);
+                }
+                return py_steps; // List[Dict] 반환
             }
-            )
+        )
         .def("batch_insert_layer0_edges",
             &Index<float>::batchInsertLayer0Edges,
             py::arg("sources"),
