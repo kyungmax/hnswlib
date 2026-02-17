@@ -586,13 +586,11 @@ class Index {
                 // 하위 임계값 추출 (O(N))
                 std::nth_element(v.begin(), v.begin() + low_idx, v.end());
                 actual_lid_low = v[low_idx];
-                std::cout << "[DEBUG] computed lower lid = " << actual_lid_low << "\n";
 
 
                 // 상위 임계값 추출
                 std::nth_element(v.begin(), v.begin() + high_idx, v.end());
                 actual_lid_high = v[high_idx];
-	            std::cout << "[DEBUG] computed upper lid = " << actual_lid_high << "\n";
 
             }
         }
