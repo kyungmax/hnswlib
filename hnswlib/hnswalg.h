@@ -1,5 +1,13 @@
 #pragma once
 
+#ifdef _OPENMP
+#include <omp.h>
+#else
+#define omp_get_max_threads() 1
+#define omp_get_num_threads() 1
+#define omp_get_thread_num() 0
+#endif
+
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
@@ -9,7 +17,6 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
-#include <omp.h>
 
 namespace hnswlib {
 typedef unsigned int linklistsizeint;
@@ -538,8 +545,7 @@ getLayer0NeighborsWithDistances() const {
         size_t stall_window_w,
         float lid_low,
         float lid_high,
-        float dist_low,
-        float dist_high,
+        float dist_stall_threshold,
         bool enable_down
     ) const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
@@ -614,18 +620,25 @@ getLayer0NeighborsWithDistances() const {
             if (locked && top_candidates.size() >= lock_target) locked = false;
 
             if (!locked && pop_count >= tmin_pops && radius_hist.size() > stall_window_w) {
-                bool stall = (radius_hist.front() - radius_hist.back()) <= 0;
+                bool stall = (radius_hist.front() - radius_hist.back()) / (radius_hist.front()) <= dist_stall_threshold;
+                std::cout << "[DEBUG] computed lid mean = " << lid_mean << "\n";
+                std::cout << "[DEBUG] before dist = " << radius_hist.front() << " after dist = " << radius_hist.back() << "stall? : " << stall << "\n";
 
                 // [UP]
-                if (stall && lid_mean >= lid_high && lowerBound >= dist_high && ef_cur < ef_max) {
+                if (stall && lid_mean >= lid_high && ef_cur < ef_max) {
                     ef_cur = std::min(ef_cur * 2, ef_max);
                     ever_up = true;
                     locked = true;
                     lock_target = ef_cur;
                 }
                 // [DOWN]
-                else if (enable_down && ever_up && stall && lid_mean <= lid_low && lowerBound <= dist_low && ef_cur > ef_min) {
+                else if (enable_down && ever_up && stall && lid_mean <= lid_low && ef_cur > ef_min) {
                     ef_cur = std::max(ef_cur / 2, ef_min);
+                    // 1. Remove the extra elements.
+                    while (top_candidates.size() > ef_cur) {
+                        top_candidates.pop();   // Pops the largest distance (top of a max‑heap).
+                    }
+                    lowerBound = top_candidates.empty() ? lowerBound : top_candidates.top().first;
                 }
             }
         }
