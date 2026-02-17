@@ -1,3 +1,11 @@
+#ifdef _OPENMP
+#include <omp.h>
+#else
+#define omp_get_max_threads() 4
+#define omp_get_num_threads() 4
+#define omp_get_thread_num() 0
+#endif
+
 #include <iostream>
 #include <limits>
 #include <pybind11/functional.h>
@@ -9,7 +17,6 @@
 #include <atomic>
 #include <stdlib.h>
 #include <assert.h>
-#include <omp.h>
 
 namespace py = pybind11;
 using namespace pybind11::literals;  // needed to bring in _a literal
@@ -561,8 +568,7 @@ class Index {
         size_t stall_window_w = 8,
         float lid_low = 0.3,
         float lid_high = 0.7,
-        float dist_low = 0.0,
-        float dist_high = 0.0,
+        float dist_stall_threshold = 0.0,
         bool enable_down = false,
         int num_threads = -1
     ) {
@@ -580,10 +586,14 @@ class Index {
                 // 하위 임계값 추출 (O(N))
                 std::nth_element(v.begin(), v.begin() + low_idx, v.end());
                 actual_lid_low = v[low_idx];
+                std::cout << "[DEBUG] computed lower lid = " << actual_lid_low << "\n";
+
 
                 // 상위 임계값 추출
                 std::nth_element(v.begin(), v.begin() + high_idx, v.end());
                 actual_lid_high = v[high_idx];
+	            std::cout << "[DEBUG] computed upper lid = " << actual_lid_high << "\n";
+
             }
         }
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
@@ -612,7 +622,7 @@ class Index {
                     ep, query_ptr, k,
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
-                    actual_lid_low, actual_lid_high, dist_low, dist_high,
+                    actual_lid_low, actual_lid_high, dist_stall_threshold,
                     enable_down
                 );
 
@@ -1299,8 +1309,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("stall_window_w") = 8,
             py::arg("lid_low") = 0.3,
             py::arg("lid_high") = 0.7,
-            py::arg("dist_low") = 0.0,
-            py::arg("dist_high") = 0.0,
+            py::arg("dist_stall_threshold") = 0.0,
             py::arg("enable_down") = false,
             py::arg("num_threads") = -1
         )
