@@ -621,12 +621,12 @@ getLayer0NeighborsWithDistances() const {
 
             if (!locked && pop_count >= tmin_pops && radius_hist.size() > stall_window_w) {
                 float dist_change_ratio = (radius_hist.front() - radius_hist.back()) / (radius_hist.front());
-                bool stall = dist_change_ratio <= dist_stall_threshold;
+                bool stall = dist_change_ratio <= dist_stall_threshold && dist_change_ratio >=0;
 
                 // [UP]
                 if (stall && lid_mean >= lid_high && ef_cur < ef_max) {
                     // debug
-                    std::cout << "Trigger UP: before ef=" <<ef_cur << ", after_ef=" << std::min(ef_cur * 2, ef_max)<< ", dist_change_ratio: " << dist_change_ratio<< std::endl;
+                    std::cout << "Trigger UP: step: "<< pop_count<<", before ef=" <<ef_cur << ", after_ef=" << std::min(ef_cur * 2, ef_max)<< ", dist_change_ratio: " << dist_change_ratio<< std::endl;
                     ef_cur = std::min(ef_cur * 2, ef_max);
                     ever_up = true;
                     locked = true;
@@ -635,7 +635,7 @@ getLayer0NeighborsWithDistances() const {
                 // [DOWN]
                 else if (enable_down && ever_up && stall && lid_mean <= lid_low && ef_cur > ef_min) {
                     // debug
-                    std::cout << "Trigger DOWN: before ef=" << ef_cur << ", after_ef=" << std::max(ef_cur / 2, ef_min) << ", dist_change_ratio: " << dist_change_ratio << std::endl;
+                    std::cout << "Trigger DOWN: step: " << pop_count << ", before ef=" << ef_cur << ", after_ef=" << std::max(ef_cur / 2, ef_min) << ", dist_change_ratio: " << dist_change_ratio << std::endl;
                     ef_cur = std::max(ef_cur / 2, ef_min);
                     // 1. Remove the extra elements.
                     while (top_candidates.size() > ef_cur) {
