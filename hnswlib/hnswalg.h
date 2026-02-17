@@ -621,8 +621,6 @@ getLayer0NeighborsWithDistances() const {
 
             if (!locked && pop_count >= tmin_pops && radius_hist.size() > stall_window_w) {
                 bool stall = (radius_hist.front() - radius_hist.back()) / (radius_hist.front()) <= dist_stall_threshold;
-                std::cout << "[DEBUG] computed lid mean = " << lid_mean << "\n";
-                std::cout << "[DEBUG] before dist = " << radius_hist.front() << " after dist = " << radius_hist.back() << "stall? : " << stall << "\n";
 
                 // [UP]
                 if (stall && lid_mean >= lid_high && ef_cur < ef_max) {
