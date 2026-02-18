@@ -531,7 +531,15 @@ getLayer0NeighborsWithDistances() const {
         return {path_info, total_dist_count};
     }
 
-    // ===== Adaptive Beam Search =====
+    // ===== Adaptive Beam Search (Final: cooldown + soft/hard up + early-stop) =====
+    //
+    // Key changes vs your previous version:
+    // 1) Cooldown is based on pop_count (not heap size). We only re-check after cooldown_pops.
+    // 2) UP is soft (×up_soft_mult) by default, but hard (×2.0) if (lid_mean >= lid_high2) OR (stall streak >= hard_stall_streak).
+    // 3) DOWN is replaced with true early termination (break) under (stall_stop && low-LID).
+    // 4) Separate stall thresholds: dist_stall_up (strict) vs dist_stall_stop (looser).
+    // 5) Robust divide-by-zero and monotonicity guards.
+
     std::priority_queue<std::pair<dist_t, labeltype>>
     searchBaseLayerAdaptive(
         tableint ep_id,
@@ -543,28 +551,49 @@ getLayer0NeighborsWithDistances() const {
         size_t tmin_pops,
         size_t lid_window_k,
         size_t stall_window_w,
-        float lid_low,
-        float lid_high,
-        float dist_stall_threshold,
-        bool enable_down
+
+        // LID thresholds (absolute LID values recommended; e.g., q25/q75/q90)
+        float  lid_low,     // e.g., q25
+        float  lid_high,    // e.g., q75
+        float  lid_high2,   // e.g., q90  (hard-trigger)
+
+        // Stall thresholds (relative improvement over window)
+        float  dist_stall_up,    // strict stall (e.g., 0.0003)
+        float  dist_stall_stop,  // looser stall for stop (e.g., 0.003)
+
+        // Control params
+        float  up_soft_mult,      // e.g., 1.4
+        size_t cooldown_pops,     // e.g., stall_window_w (or 2*stall_window_w)
+        int    hard_stall_streak, // e.g., 2
+        bool   enable_stop        // formerly enable_down; now means enable early-stop
     ) const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
-        size_t pop_count = 0;
-        bool ever_up = false;
-        bool locked = false;
-        size_t lock_target = ef_cur;
+        ef_cur = std::min(ef_cur, ef_max);
 
-        // LID & Stagnation tracking
-        std::vector<float> lid_hist; lid_hist.reserve(lid_window_k);
+        size_t pop_count = 0;
+        size_t next_check_pop = tmin_pops; // first check after warm-up
+        int stall_streak = 0;
+
+        // LID tracking (rolling mean)
+        std::vector<float> lid_hist;
+        lid_hist.reserve(lid_window_k);
         float lid_sum = 0.0f;
-        std::vector<dist_t> radius_hist; radius_hist.reserve(stall_window_w + 1);
+
+        // Radius (lowerBound) tracking for stall detection
+        std::vector<dist_t> radius_hist;
+        radius_hist.reserve(stall_window_w + 1);
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+        std::priority_queue<std::pair<dist_t, tableint>,
+                            std::vector<std::pair<dist_t, tableint>>,
+                            CompareByFirst> top_candidates;
+
+        std::priority_queue<std::pair<dist_t, tableint>,
+                            std::vector<std::pair<dist_t, tableint>>,
+                            CompareByFirst> candidate_set;
 
         dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
         dist_t lowerBound = dist;
@@ -574,26 +603,29 @@ getLayer0NeighborsWithDistances() const {
         visited_array[ep_id] = visited_array_tag;
 
         while (!candidate_set.empty()) {
-            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            auto current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
 
+            // Standard HNSW termination condition
             if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
 
             candidate_set.pop();
             pop_count++;
             tableint curr_id = current_node_pair.second;
 
-            // 1. Rolling LID Mean 계산 (C++ 내부 처리)
+            // ---- 1) Rolling LID mean ----
             float n_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
             lid_sum += n_lid;
             lid_hist.push_back(n_lid);
+
             if (lid_hist.size() > lid_window_k) {
-                lid_sum -= lid_hist[0];
+                lid_sum -= lid_hist.front();
+                // NOTE: O(W) erase; ok for small W (e.g., 20). Use ring buffer if needed.
                 lid_hist.erase(lid_hist.begin());
             }
-            float lid_mean = lid_sum / lid_hist.size();
+            float lid_mean = lid_sum / std::max<size_t>(1, lid_hist.size());
 
-            // 2. Neighbor Expansion
+            // ---- 2) Neighbor Expansion (standard) ----
             linklistsizeint *ll = get_linklist0(curr_id);
             size_t size = getListCount(ll);
             tableint *data = (tableint *)(ll + 1);
@@ -607,47 +639,81 @@ getLayer0NeighborsWithDistances() const {
                 if (top_candidates.size() < ef_cur || lowerBound > d) {
                     candidate_set.emplace(-d, cand_id);
                     top_candidates.emplace(d, cand_id);
+
                     if (top_candidates.size() > ef_cur) top_candidates.pop();
                     if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
                 }
             }
 
-            // 3. Stagnation (Radius) tracking
+            // ---- 3) Radius history for stall detection ----
             radius_hist.push_back(lowerBound);
-            if (radius_hist.size() > stall_window_w + 1) radius_hist.erase(radius_hist.begin());
+            if (radius_hist.size() > stall_window_w + 1) {
+                // NOTE: O(W) erase; ok for small W. Use ring buffer if needed.
+                radius_hist.erase(radius_hist.begin());
+            }
 
-            // 4. Adaptive Logic (Lock & Trigger)
-            if (locked && top_candidates.size() >= lock_target) locked = false;
+            // ---- 4) Adaptive control (only after warm-up, only when enough history, only when cooldown passed) ----
+            if (pop_count < next_check_pop) continue;
+            if (radius_hist.size() <= stall_window_w) continue;
 
-            if (!locked && pop_count >= tmin_pops && radius_hist.size() > stall_window_w) {
-                float dist_change_ratio = (radius_hist.front() - radius_hist.back()) / (radius_hist.front());
-                bool stall = dist_change_ratio <= dist_stall_threshold && dist_change_ratio >=0;
+            const double denom = std::max<double>((double)radius_hist.front(), 1e-12);
+            const double delta = (double)radius_hist.front() - (double)radius_hist.back();
+            const double ratio = delta / denom;
 
-                // [UP]
-                if (stall && lid_mean >= lid_high && ef_cur < ef_max) {
-                    // debug
-                    std::cout << "Trigger UP: step: "<< pop_count<<", before ef=" <<ef_cur << ", after_ef=" << std::min(ef_cur * 2, ef_max)<< ", dist_change_ratio: " << dist_change_ratio<< std::endl;
-                    ef_cur = std::min(ef_cur * 2, ef_max);
-                    ever_up = true;
-                    locked = true;
-                    lock_target = ef_cur;
-                }
-                // [DOWN]
-                else if (enable_down && ever_up && stall && lid_mean <= lid_low && ef_cur > ef_min) {
-                    // debug
-                    std::cout << "Trigger DOWN: step: " << pop_count << ", before ef=" << ef_cur << ", after_ef=" << std::max(ef_cur / 2, ef_min) << ", dist_change_ratio: " << dist_change_ratio << std::endl;
-                    ef_cur = std::max(ef_cur / 2, ef_min);
-                    // 1. Remove the extra elements.
-                    while (top_candidates.size() > ef_cur) {
-                        top_candidates.pop();   // Pops the largest distance (top of a max‑heap).
-                    }
-                    lowerBound = top_candidates.empty() ? lowerBound : top_candidates.top().first;
-                }
+            // guard: if ratio < 0, it means "got worse" (noise / heap effects). Treat as not-stall and reset streak.
+            const bool ratio_valid = (ratio >= 0.0);
+            const bool stall_up    = ratio_valid && (ratio <= (double)dist_stall_up);
+            const bool stall_stop  = ratio_valid && (ratio <= (double)dist_stall_stop);
+
+            if (stall_up) stall_streak++;
+            else stall_streak = 0;
+
+            // (A) EARLY STOP: low-LID + (looser) stall -> break
+            if (enable_stop && stall_stop && (lid_mean <= lid_low)) {
+                // Optional: require streak to avoid single noisy trigger
+                // if (stall_streak < 2) { next_check_pop = pop_count + cooldown_pops; continue; }
+
+                // Debug
+                std::cout << "STOP: pop=" << pop_count << " ef=" << ef_cur
+                          << " lid=" << lid_mean << " ratio=" << ratio << "\n";
+
+                break;
+            }
+
+            // (B) UP: high-LID + (strict) stall -> increase ef
+            if (stall_up && (lid_mean >= lid_high) && (ef_cur < ef_max)) {
+                float mult = up_soft_mult;
+
+                const bool hard_by_lid = (lid_mean >= lid_high2);
+                const bool hard_by_streak = (stall_streak >= hard_stall_streak);
+                if (hard_by_lid || hard_by_streak) mult = 2.0f;
+
+                size_t next_ef = (size_t)std::ceil((double)ef_cur * (double)mult);
+                if (next_ef <= ef_cur) next_ef = ef_cur + 1; // ensure progress
+                size_t final_ef = std::min(next_ef, ef_max);
+
+                // Debug
+                std::cout << "UP: pop=" << pop_count << " ef " << ef_cur << "->" << final_ef
+                          << " lid=" << lid_mean << " ratio=" << ratio
+                          << " hard=" << (hard_by_lid || hard_by_streak) << "\n";
+
+                ef_cur = final_ef;
+
+                // IMPORTANT: After changing ef, give it time to reflect (cooldown)
+                next_check_pop = pop_count + cooldown_pops;
+
+                // reset streak so we don't immediately re-trigger UP again
+                stall_streak = 0;
+            } else {
+                // even if no action, you may want to check again after a short interval
+                next_check_pop = pop_count + stall_window_w;
             }
         }
 
         visited_list_pool_->releaseVisitedList(vl);
+
         while (top_candidates.size() > k) top_candidates.pop();
+
         std::priority_queue<std::pair<dist_t, labeltype>> result;
         while (!top_candidates.empty()) {
             result.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
