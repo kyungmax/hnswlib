@@ -548,43 +548,53 @@ class Index {
         return {py::cast(std::move(py_results)), total_count};
     }
 
-    py::object knnQueryAdaptive(
+py::object knnQueryAdaptive(
         py::object input,
         size_t k = 1,
         size_t ef_init = 128,
         size_t ef_max = 1024,
         size_t ef_min = 64,
-        size_t tmin_pops = 30,
-        size_t lid_window_k = 8,
-        size_t stall_window_w = 8,
-        float lid_low = 0.3,
-        float lid_high = 0.7,
-        float dist_stall_threshold = 0.0,
-        bool enable_down = false,
+        size_t tmin_pops = 64,
+        size_t lid_window_k = 20,
+        size_t stall_window_w = 20,
+        float lid_low = 0.25f,
+        float lid_high = 0.75f,
+        float lid_high2 = 0.90f,
+        float dist_stall_up = 0.0003f,
+        float dist_stall_stop = 0.003f,
+        float up_soft_mult = 1.4f,
+        size_t cooldown_pops = 0,
+        int hard_stall_streak = 2,
+        bool enable_stop = true,
         int num_threads = -1
     ) {
-        float actual_lid_low = 0.0f;
-        float actual_lid_high = 0.0f;
-        if (!appr_alg->node_lid_.empty()) {
-            std::vector<float> v = appr_alg->node_lid_; // 복사본 생성 (std::nth_element용)
-            // 0이 아닌 유효한 LID들만 모음 (필요 시)
-            // v.erase(std::remove(v.begin(), v.end(), 0.0f), v.end());
+        float actual_lid_low  = lid_low;
+        float actual_lid_high = lid_high;
+        float actual_lid_high2 = lid_high2;
 
-            if (!v.empty()) {
-                size_t low_idx = static_cast<size_t>(v.size() * lid_low);
-                size_t high_idx = static_cast<size_t>(v.size() * lid_high);
+        // If lid_* are given as quantiles in (0,1), convert them to absolute thresholds
+        // using the precomputed node LIDs. Otherwise, treat them as absolute LID values.
+        auto quantile_to_value = [&](float q) -> float {
+            if (appr_alg->node_lid_.empty()) return q;
+            if (!(q > 0.0f && q < 1.0f)) return q; // already absolute
+            std::vector<float> v = appr_alg->node_lid_; // copy for nth_element
+            if (v.empty()) return q;
 
-                // 하위 임계값 추출 (O(N))
-                std::nth_element(v.begin(), v.begin() + low_idx, v.end());
-                actual_lid_low = v[low_idx];
+            // Clamp index into [0, n-1]
+            size_t n = v.size();
+            size_t idx = static_cast<size_t>(q * static_cast<float>(n));
+            if (idx >= n) idx = n - 1;
 
+            std::nth_element(v.begin(), v.begin() + idx, v.end());
+            return v[idx];
+        };
 
-                // 상위 임계값 추출
-                std::nth_element(v.begin(), v.begin() + high_idx, v.end());
-                actual_lid_high = v[high_idx];
+        actual_lid_low   = quantile_to_value(lid_low);
+        actual_lid_high  = quantile_to_value(lid_high);
+        actual_lid_high2 = quantile_to_value(lid_high2);
 
-            }
-        }
+        if (cooldown_pops == 0) cooldown_pops = stall_window_w;
+
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
         auto buffer = items.request();
         size_t rows, features;
@@ -611,8 +621,10 @@ class Index {
                     ep, query_ptr, k,
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
-                    actual_lid_low, actual_lid_high, dist_stall_threshold,
-                    enable_down
+                    actual_lid_low, actual_lid_high, actual_lid_high2,
+                    dist_stall_up, dist_stall_stop,
+                    up_soft_mult, cooldown_pops, hard_stall_streak,
+                    enable_stop
                 );
 
                 for (int i = (int)k - 1; i >= 0; i--) {
@@ -1293,13 +1305,25 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("ef_init") = 128,
             py::arg("ef_max") = 1024,
             py::arg("ef_min") = 64,
-            py::arg("tmin_pops") = 30,
-            py::arg("lid_window_k") = 8,
-            py::arg("stall_window_w") = 8,
-            py::arg("lid_low") = 0.3,
-            py::arg("lid_high") = 0.7,
-            py::arg("dist_stall_threshold") = 0.0,
-            py::arg("enable_down") = false,
+            py::arg("tmin_pops") = 64,
+            py::arg("lid_window_k") = 20,
+            py::arg("stall_window_w") = 20,
+            // lid_low/lid_high/lid_high2:
+            //  - If in (0,1): interpreted as quantiles of node LID distribution (e.g., 0.25/0.75/0.90)
+            //  - Else: treated as absolute LID thresholds
+            py::arg("lid_low") = 0.25f,
+            py::arg("lid_high") = 0.75f,
+            py::arg("lid_high2") = 0.90f,
+            // Stall thresholds (relative improvement over the last W steps)
+            py::arg("dist_stall_up") = 0.0003f,
+            py::arg("dist_stall_stop") = 0.003f,
+            // UP control
+            py::arg("up_soft_mult") = 1.4f,
+            // cooldown_pops=0 means "use stall_window_w"
+            py::arg("cooldown_pops") = 0,
+            py::arg("hard_stall_streak") = 2,
+            // enable_stop: early termination on (stall_stop && low-LID)
+            py::arg("enable_stop") = true,
             py::arg("num_threads") = -1
         )
         .def("calc_lids_internal", &Index<float>::calcLidsInternal,
