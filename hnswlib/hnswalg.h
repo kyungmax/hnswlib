@@ -601,6 +601,7 @@ getLayer0NeighborsWithDistances() const {
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
+        bool buffer_full = false;
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
@@ -642,14 +643,18 @@ getLayer0NeighborsWithDistances() const {
             float lid_mean = lid_sum / (float)lid_window_k;
 
             // 2) Radius Ring Buffer 업데이트
-            radius_hist[rad_idx] = lowerBound;
-            // W+1 크기 배열에서 (현재 인덱스 + 1) % (W+1)은 항상 'W단계 전'의 데이터임
-            size_t oldest_rad_idx = (rad_idx + 1) % (stall_window_w + 1);
-            dist_t oldest_radius = radius_hist[oldest_rad_idx];
+            dist_t oldest_radius = radius_hist[rad_idx]; // 덮어쓰기 전의 값이 가장 오래된 값(W단계 전)
+            radius_hist[rad_idx] = lowerBound;           // 현재 값으로 덮어쓰기
             rad_idx = (rad_idx + 1) % (stall_window_w + 1);
+
+            // 버퍼가 한 바퀴 다 돌았는지 체크
+            if (!buffer_full && rad_idx == 0) {
+                buffer_full = true;
+            }
 
             // ---- 4) Adaptive control (only after warm-up, only when enough history, only when cooldown passed) ----
             if (pop_count < next_check_pop) continue;
+            if (!buffer_full) continue;
             if (radius_hist.size() <= stall_window_w) continue;
 
             const double denom = std::max<double>((double)oldest_radius, 1e-12);
@@ -677,33 +682,40 @@ getLayer0NeighborsWithDistances() const {
             }
 
             // (B) UP: high-LID + (strict) stall -> increase ef
-            if (stall_up && (lid_mean >= lid_high) && (ef_cur < ef_max)) {
-                float mult = up_soft_mult;
+            if (stall_up && (ef_cur < ef_max)) {
+                float mult = 1.0f;
+                bool trigger_up = false;
 
-                const bool hard_by_lid = (lid_mean >= lid_high2);
-                const bool hard_by_streak = (stall_streak >= hard_stall_streak);
-                if (hard_by_lid || hard_by_streak) mult = 2.0f;
+                if (lid_mean >= lid_high) {
+                    // 고LID: 공격적 확장 (기존 로직 유지)
+                    trigger_up = true;
+                    mult = (lid_mean >= lid_high2 || stall_streak >= hard_stall_streak) ? 2.0f : up_soft_mult;
+                }
+                else if (lid_mean > lid_low) {
+                    // 중LID (회색 지대): 국소 최적해 탈출을 위한 소폭 확장
+                    // 사용자 로그의 lid_mean: 12.9, lid_low: 14.6 케이스를 구제하기 위해
+                    // lid_low 근처에서도 stall_streak이 쌓이면 확장을 고려할 수 있습니다.
+                    trigger_up = true;
+                    mult = 1.2f; // 완만한 확장
+                }
 
-                size_t next_ef = (size_t)std::ceil((double)ef_cur * (double)mult);
-                if (next_ef <= ef_cur) next_ef = ef_cur + 1; // ensure progress
-                size_t final_ef = std::min(next_ef, ef_max);
+                if (trigger_up) {
+                    size_t next_ef = (size_t)std::ceil((double)ef_cur * (double)mult);
+                    if (next_ef <= ef_cur) next_ef = ef_cur + 1;
+                    size_t final_ef = std::min(next_ef, ef_max);
 
-                // Debug
-                std::cout << "UP: pop=" << pop_count << " ef " << ef_cur << "->" << final_ef
-                          << " lid=" << lid_mean << " ratio=" << ratio
-                          << " hard=" << (hard_by_lid || hard_by_streak) << "\n";
+                    std::cout << "UP: pop=" << pop_count << " ef " << ef_cur << "->" << final_ef
+                            << " lid=" << lid_mean << " ratio=" << ratio << "\n";
 
-                ef_cur = final_ef;
-
-                // IMPORTANT: After changing ef, give it time to reflect (cooldown)
-                next_check_pop = pop_count + cooldown_pops;
-
-                // reset streak so we don't immediately re-trigger UP again
-                stall_streak = 0;
-            } else {
-                // even if no action, you may want to check again after a short interval
-                next_check_pop = pop_count + stall_window_w;
+                    ef_cur = final_ef;
+                    next_check_pop = pop_count + cooldown_pops;
+                    stall_streak = 0;
+                    continue;
+                }
             }
+
+            // [갈래 3] STAY: 정체가 없거나 중립 구간일 경우 현재 ef 유지
+            next_check_pop = pop_count + stall_window_w;
         }
 
         visited_list_pool_->releaseVisitedList(vl);
