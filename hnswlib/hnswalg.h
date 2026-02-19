@@ -652,8 +652,8 @@ getLayer0NeighborsWithDistances() const {
             if (pop_count < next_check_pop) continue;
             if (radius_hist.size() <= stall_window_w) continue;
 
-            const double denom = std::max<double>((double)radius_hist.front(), 1e-12);
-            const double delta = (double)radius_hist.front() - (double)radius_hist.back();
+            const double denom = std::max<double>((double)oldest_radius, 1e-12);
+            const double delta = (double)oldest_radius - (double)lowerBound;
             const double ratio = delta / denom;
 
             // guard: if ratio < 0, it means "got worse" (noise / heap effects). Treat as not-stall and reset streak.
