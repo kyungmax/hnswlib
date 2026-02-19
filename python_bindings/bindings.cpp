@@ -557,9 +557,9 @@ py::object knnQueryAdaptive(
         size_t tmin_pops = 64,
         size_t lid_window_k = 20,
         size_t stall_window_w = 20,
-        float lid_low = 0.25f,
-        float lid_high = 0.75f,
-        float lid_high2 = 0.90f,
+        float lid_low = 0.0f,
+        float lid_high = 0.0f,
+        float lid_high2 = 0.0f,
         float dist_stall_up = 0.0003f,
         float dist_stall_stop = 0.003f,
         float up_soft_mult = 1.4f,
@@ -568,31 +568,6 @@ py::object knnQueryAdaptive(
         bool enable_stop = true,
         int num_threads = -1
     ) {
-        float actual_lid_low  = lid_low;
-        float actual_lid_high = lid_high;
-        float actual_lid_high2 = lid_high2;
-
-        // If lid_* are given as quantiles in (0,1), convert them to absolute thresholds
-        // using the precomputed node LIDs. Otherwise, treat them as absolute LID values.
-        auto quantile_to_value = [&](float q) -> float {
-            if (appr_alg->node_lid_.empty()) return q;
-            if (!(q > 0.0f && q < 1.0f)) return q; // already absolute
-            std::vector<float> v = appr_alg->node_lid_; // copy for nth_element
-            if (v.empty()) return q;
-
-            // Clamp index into [0, n-1]
-            size_t n = v.size();
-            size_t idx = static_cast<size_t>(q * static_cast<float>(n));
-            if (idx >= n) idx = n - 1;
-
-            std::nth_element(v.begin(), v.begin() + idx, v.end());
-            return v[idx];
-        };
-
-        actual_lid_low   = quantile_to_value(lid_low);
-        actual_lid_high  = quantile_to_value(lid_high);
-        actual_lid_high2 = quantile_to_value(lid_high2);
-
         if (cooldown_pops == 0) cooldown_pops = stall_window_w;
 
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
@@ -621,7 +596,7 @@ py::object knnQueryAdaptive(
                     ep, query_ptr, k,
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
-                    actual_lid_low, actual_lid_high, actual_lid_high2,
+                    lid_low, lid_high, lid_high2,
                     dist_stall_up, dist_stall_stop,
                     up_soft_mult, cooldown_pops, hard_stall_streak,
                     enable_stop
@@ -673,6 +648,18 @@ py::object knnQueryAdaptive(
             });
         }
     }
+
+    py::array_t<float> getLids() {
+    if (!appr_alg || appr_alg->node_lid_.empty()) {
+        return py::array_t<float>(0);
+    }
+    // node_lid_ 벡터를 NumPy 배열로 복사하여 반환
+    return py::array_t<float>(
+        { appr_alg->node_lid_.size() },
+        { sizeof(float) },
+        appr_alg->node_lid_.data()
+    );
+}
 
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
@@ -1309,8 +1296,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("lid_window_k") = 20,
             py::arg("stall_window_w") = 20,
             // lid_low/lid_high/lid_high2:
-            //  - If in (0,1): interpreted as quantiles of node LID distribution (e.g., 0.25/0.75/0.90)
-            //  - Else: treated as absolute LID thresholds
+            // not quantile, absolute value
             py::arg("lid_low") = 0.25f,
             py::arg("lid_high") = 0.75f,
             py::arg("lid_high2") = 0.90f,
@@ -1326,6 +1312,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("enable_stop") = true,
             py::arg("num_threads") = -1
         )
+        .def("get_lids", &Index<float>::getLids)
         .def("calc_lids_internal", &Index<float>::calcLidsInternal,
             py::arg("k_lid"),
             py::arg("num_threads") = -1,

@@ -574,14 +574,14 @@ getLayer0NeighborsWithDistances() const {
         size_t next_check_pop = tmin_pops; // first check after warm-up
         int stall_streak = 0;
 
-        // LID tracking (rolling mean)
-        std::vector<float> lid_hist;
-        lid_hist.reserve(lid_window_k);
+        // LID tracking (rolling mean - ring buffer)
+        std::vector<float> lid_hist(lid_window_k, 0.0f);
+        size_t lid_idx = 0;
         float lid_sum = 0.0f;
 
         // Radius (lowerBound) tracking for stall detection
-        std::vector<dist_t> radius_hist;
-        radius_hist.reserve(stall_window_w + 1);
+        std::vector<dist_t> radius_hist(stall_window_w + 1, 0.0f);
+        size_t rad_idx = 0;
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -613,18 +613,6 @@ getLayer0NeighborsWithDistances() const {
             pop_count++;
             tableint curr_id = current_node_pair.second;
 
-            // ---- 1) Rolling LID mean ----
-            float n_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
-            lid_sum += n_lid;
-            lid_hist.push_back(n_lid);
-
-            if (lid_hist.size() > lid_window_k) {
-                lid_sum -= lid_hist.front();
-                // NOTE: O(W) erase; ok for small W (e.g., 20). Use ring buffer if needed.
-                lid_hist.erase(lid_hist.begin());
-            }
-            float lid_mean = lid_sum / std::max<size_t>(1, lid_hist.size());
-
             // ---- 2) Neighbor Expansion (standard) ----
             linklistsizeint *ll = get_linklist0(curr_id);
             size_t size = getListCount(ll);
@@ -645,12 +633,20 @@ getLayer0NeighborsWithDistances() const {
                 }
             }
 
-            // ---- 3) Radius history for stall detection ----
-            radius_hist.push_back(lowerBound);
-            if (radius_hist.size() > stall_window_w + 1) {
-                // NOTE: O(W) erase; ok for small W. Use ring buffer if needed.
-                radius_hist.erase(radius_hist.begin());
-            }
+            // 1) LID Ring Buffer 업데이트
+            float n_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
+            lid_sum -= lid_hist[lid_idx];
+            lid_hist[lid_idx] = n_lid;
+            lid_sum += n_lid;
+            lid_idx = (lid_idx + 1) % lid_window_k;
+            float lid_mean = lid_sum / (float)lid_window_k;
+
+            // 2) Radius Ring Buffer 업데이트
+            radius_hist[rad_idx] = lowerBound;
+            // W+1 크기 배열에서 (현재 인덱스 + 1) % (W+1)은 항상 'W단계 전'의 데이터임
+            size_t oldest_rad_idx = (rad_idx + 1) % (stall_window_w + 1);
+            dist_t oldest_radius = radius_hist[oldest_rad_idx];
+            rad_idx = (rad_idx + 1) % (stall_window_w + 1);
 
             // ---- 4) Adaptive control (only after warm-up, only when enough history, only when cooldown passed) ----
             if (pop_count < next_check_pop) continue;
