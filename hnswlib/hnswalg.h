@@ -601,6 +601,7 @@ getLayer0NeighborsWithDistances() const {
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
+        bool buffer_full = false;
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
@@ -642,14 +643,18 @@ getLayer0NeighborsWithDistances() const {
             float lid_mean = lid_sum / (float)lid_window_k;
 
             // 2) Radius Ring Buffer 업데이트
-            radius_hist[rad_idx] = lowerBound;
-            // W+1 크기 배열에서 (현재 인덱스 + 1) % (W+1)은 항상 'W단계 전'의 데이터임
-            size_t oldest_rad_idx = (rad_idx + 1) % (stall_window_w + 1);
-            dist_t oldest_radius = radius_hist[oldest_rad_idx];
+            dist_t oldest_radius = radius_hist[rad_idx]; // 덮어쓰기 전의 값이 가장 오래된 값(W단계 전)
+            radius_hist[rad_idx] = lowerBound;           // 현재 값으로 덮어쓰기
             rad_idx = (rad_idx + 1) % (stall_window_w + 1);
+
+            // 버퍼가 한 바퀴 다 돌았는지 체크
+            if (!buffer_full && rad_idx == 0) {
+                buffer_full = true;
+            }
 
             // ---- 4) Adaptive control (only after warm-up, only when enough history, only when cooldown passed) ----
             if (pop_count < next_check_pop) continue;
+            if (!buffer_full) continue;
             if (radius_hist.size() <= stall_window_w) continue;
 
             const double denom = std::max<double>((double)oldest_radius, 1e-12);
