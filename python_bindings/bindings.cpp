@@ -569,7 +569,7 @@ py::object knnQueryAdaptive(
         float lid_low = 0.0f,
         float lid_high = 0.0f,
         float lid_high2 = 0.0f,
-        float dist_stall_up = 0.0003f,
+        float dist_stall_stop_early = 0.0003f,
         float dist_stall_stop = 0.003f,
         float up_soft_mult = 1.4f,
         size_t cooldown_pops = 0,
@@ -585,19 +585,28 @@ py::object knnQueryAdaptive(
         get_input_array_shapes(buffer, &rows, &features);
 
         if (num_threads <= 0) num_threads = num_threads_default;
+        // Small batch: throttle threads for speed (same as fast path)
+        if (rows <= (size_t)num_threads * 4) {
+            num_threads = 1;
+        }
 
         hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
         dist_t* data_numpy_d = new dist_t[rows * k];
 
         {
+            // Preallocate normalization buffer per-thread (as in fast path)
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
             py::gil_scoped_release l;
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                 const float* query_ptr = (const float*)items.data(row);
-                std::vector<float> norm_query;
                 if (normalize) {
-                    norm_query.resize(dim);
-                    normalize_vector((float*)items.data(row), norm_query.data());
-                    query_ptr = norm_query.data();
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
                 }
 
                 hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
@@ -606,7 +615,7 @@ py::object knnQueryAdaptive(
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
                     lid_low, lid_high, lid_high2,
-                    dist_stall_up, dist_stall_stop,
+                    dist_stall_stop_early, dist_stall_stop,
                     up_soft_mult, cooldown_pops, hard_stall_streak,
                     enable_stop
                 );
@@ -1310,7 +1319,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("lid_high") = 0.75f,
             py::arg("lid_high2") = 0.90f,
             // Stall thresholds (relative improvement over the last W steps)
-            py::arg("dist_stall_up") = 0.0003f,
+            py::arg("dist_stall_stop_early") = 0.0003f,
             py::arg("dist_stall_stop") = 0.003f,
             // UP control
             py::arg("up_soft_mult") = 1.4f,

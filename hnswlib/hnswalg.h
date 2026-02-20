@@ -558,7 +558,7 @@ getLayer0NeighborsWithDistances() const {
         float  lid_high2,   // e.g., q90  (hard-trigger)
 
         // Stall thresholds (relative improvement over window)
-        float  dist_stall_up,    // strict stall (e.g., 0.0003)
+        float  dist_stall_stop_early,    // strict stall (e.g., 0.0003) (repurposed as early_slope_threshold)
         float  dist_stall_stop,  // looser stall for stop (e.g., 0.003)
 
         // Control params
@@ -570,18 +570,49 @@ getLayer0NeighborsWithDistances() const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
         ef_cur = std::min(ef_cur, ef_max);
 
-        size_t pop_count = 0;
-        size_t next_check_pop = tmin_pops; // first check after warm-up
-        int stall_streak = 0;
+        // ===== One-shot EASY stop detector (fill -> fill+20) =====
+        // Detect when the result set becomes full (size reaches ef_init), then
+        // measure lowerBound improvement after 20 more pops. If improvement is large
+        // AND the mean LID in that short window is low, we early-terminate (break).
+        static constexpr size_t FILL_DELTA_POPS = 20;
 
-        // LID tracking (rolling mean - ring buffer)
-        std::vector<float> lid_hist(lid_window_k, 0.0f);
-        size_t lid_idx = 0;
-        float lid_sum = 0.0f;
+        // ============================================================
+        // Data-driven stop schedule (regression from ef=64/128/256/512):
+        //
+        // 1) EASY signal threshold on s_rel (fill -> fill+20):
+        //    Empirically, the "safe" s_rel threshold decreases as ef_init increases.
+        //    A simple linear fit that matches our glove-200-angular trajectories:
+        //
+        //      s_rel_th(ef) ≈ 0.46 - 0.00032 * ef
+        //
+        //    Clamp to a sane range to avoid extreme values.
+        //
+        // 2) Deferred stop pop target:
+        //    Fixed pop=60 worked for ef=128 but breaks for larger ef (e.g., ef=512).
+        //    Empirically, a good schedule is ~ef/2 with a minimum of 30.
+        //
+        //      TARGET_STOP_POP(ef) = max(30, ef/2)
+        //
+        // NOTE: We still keep the API parameters (dist_stall_stop_early, dist_stall_stop, lid_low)
+        // to allow manual override. If dist_stall_stop_early > 0, we use it as an override;
+        // otherwise we use the regression value.
+        // ============================================================
 
-        // Radius (lowerBound) tracking for stall detection
-        std::vector<dist_t> radius_hist(stall_window_w + 1, 0.0f);
-        size_t rad_idx = 0;
+        const float s_rel_th_reg = std::max(0.25f, std::min(0.45f, 0.46f - 0.00032f * (float)ef_init));
+        const float s_rel_th = (dist_stall_stop_early > 0.0f) ? dist_stall_stop_early : 0.9*s_rel_th_reg;
+
+        const size_t TARGET_STOP_POP = std::max<size_t>(30, ef_init / 2);
+
+        bool fill_seen = false;
+        size_t fill_pop = 0;
+        dist_t dist_fill = (dist_t)0;
+        double lid_sum_fill = 0.0;
+        size_t lid_cnt_fill = 0;
+
+        bool stop_done = false;  // ensure we evaluate at most once
+        bool defer_stop = false;         // whether we plan to stop later
+        double early_s_rel = -1.0;        // cached s_rel measured at fill+10
+        double early_lid_mean = 0.0;      // cached lid_mean measured at fill+10
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -598,10 +629,11 @@ getLayer0NeighborsWithDistances() const {
         dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
         dist_t lowerBound = dist;
 
+        size_t pop_count = 0;
+
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
-        bool buffer_full = false;
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
@@ -611,8 +643,9 @@ getLayer0NeighborsWithDistances() const {
             if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
 
             candidate_set.pop();
-            pop_count++;
             tableint curr_id = current_node_pair.second;
+
+            pop_count++;
 
             // ---- 2) Neighbor Expansion (standard) ----
             linklistsizeint *ll = get_linklist0(curr_id);
@@ -634,88 +667,67 @@ getLayer0NeighborsWithDistances() const {
                 }
             }
 
-            // 1) LID Ring Buffer 업데이트
-            float n_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
-            lid_sum -= lid_hist[lid_idx];
-            lid_hist[lid_idx] = n_lid;
-            lid_sum += n_lid;
-            lid_idx = (lid_idx + 1) % lid_window_k;
-            float lid_mean = lid_sum / (float)lid_window_k;
+            // ===== One-shot EASY stop detector: fill -> fill+20 =====
+            if (enable_stop) {
+                // One-time measurement logic runs only until we evaluate at fill_pop + FILL_DELTA_POPS.
+                if (!stop_done) {
+                    // (a) Detect first time the result set is "full enough" (reaches ef_init).
+                    // Note: ef_cur starts as ef_init; we detect fill before any stop triggers.
+                    if (!fill_seen && top_candidates.size() >= ef_init) {
+                        fill_seen = true;
+                        fill_pop = pop_count;
+                        dist_fill = lowerBound;
 
-            // 2) Radius Ring Buffer 업데이트
-            dist_t oldest_radius = radius_hist[rad_idx]; // 덮어쓰기 전의 값이 가장 오래된 값(W단계 전)
-            radius_hist[rad_idx] = lowerBound;           // 현재 값으로 덮어쓰기
-            rad_idx = (rad_idx + 1) % (stall_window_w + 1);
+                        // reset window accumulators
+                        lid_sum_fill = 0.0;
+                        lid_cnt_fill = 0;
+                    }
 
-            // 버퍼가 한 바퀴 다 돌았는지 체크
-            if (!buffer_full && rad_idx == 0) {
-                buffer_full = true;
-            }
+                    // (b) Accumulate LID only during the short post-fill window.
+                    if (fill_seen && pop_count >= fill_pop && pop_count <= fill_pop + FILL_DELTA_POPS) {
+                        float spot_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
+                        lid_sum_fill += (double)spot_lid;
+                        lid_cnt_fill += 1;
+                    }
 
-            // ---- 4) Adaptive control (only after warm-up, only when enough history, only when cooldown passed) ----
-            if (pop_count < next_check_pop) continue;
-            if (!buffer_full) continue;
-            if (radius_hist.size() <= stall_window_w) continue;
+                    // (c) Evaluate exactly at fill_pop + 20.
+                    if (fill_seen && pop_count == fill_pop + FILL_DELTA_POPS) {
+                        stop_done = true;
 
-            const double denom = std::max<double>((double)oldest_radius, 1e-12);
-            const double delta = (double)oldest_radius - (double)lowerBound;
-            const double ratio = delta / denom;
+                        const double denom = std::max<double>((double)std::abs((double)dist_fill), 1e-12);
+                        const double delta = (double)dist_fill - (double)lowerBound;
+                        const double s_rel = delta / denom;
 
-            // guard: if ratio < 0, it means "got worse" (noise / heap effects). Treat as not-stall and reset streak.
-            const bool ratio_valid = (ratio >= 0.0);
-            const bool stall_up    = ratio_valid && (ratio <= (double)dist_stall_up);
-            const bool stall_stop  = ratio_valid && (ratio <= (double)dist_stall_stop);
+                        const double lid_mean = (lid_cnt_fill > 0) ? (lid_sum_fill / (double)lid_cnt_fill) : 0.0;
 
-            if (stall_up) stall_streak++;
-            else stall_streak = 0;
+                        // Cache for possible deferred stop.
+                        early_s_rel = s_rel;
+                        early_lid_mean = lid_mean;
 
-            // (A) EARLY STOP: low-LID + (looser) stall -> break
-            if (enable_stop && stall_stop && (lid_mean <= lid_low)) {
-                // Optional: require streak to avoid single noisy trigger
-                // if (stall_streak < 2) { next_check_pop = pop_count + cooldown_pops; continue; }
+                        // Decision:
+                        // - If the early signal is strong, mark for stop at ~60 pops.
+                        //   (We only actually stop at pop_count >= TARGET_STOP_POP.)
+                        const bool lid_ok = (lid_mean <= (double)lid_low);
 
-                // Debug
-                std::cout << "STOP: pop=" << pop_count << " ef=" << ef_cur
-                          << " lid=" << lid_mean << " ratio=" << ratio << "\n";
+                        // Mark for stop at TARGET_STOP_POP(ef) pops if early signal is strong.
+                        // Use data-driven s_rel_th threshold (regression or override).
+                        if (lid_ok && s_rel >= (double)s_rel_th) {
+                            defer_stop = true;
+                        }
+                    }
+                } // end if (!stop_done)
 
-                break;
-            }
+                // Deferred stop: if the early signal was strong, stop at TARGET_STOP_POP(ef).
+                if (defer_stop && pop_count >= TARGET_STOP_POP) {
+                    std::cout << "EASY_STOP_DEFER: pop=" << pop_count
+                              << " fill_pop=" << fill_pop
+                              << " early_s_rel=" << early_s_rel
+                              << " early_lid_mean=" << early_lid_mean
+                              << " ef=" << ef_cur << std::endl;
 
-            // (B) UP: high-LID + (strict) stall -> increase ef
-            if (stall_up && (ef_cur < ef_max)) {
-                float mult = 1.0f;
-                bool trigger_up = false;
-
-                if (lid_mean >= lid_high) {
-                    // 고LID: 공격적 확장 (기존 로직 유지)
-                    trigger_up = true;
-                    mult = (lid_mean >= lid_high2 || stall_streak >= hard_stall_streak) ? 2.0f : up_soft_mult;
-                }
-                else if (lid_mean > lid_low) {
-                    // 중LID (회색 지대): 국소 최적해 탈출을 위한 소폭 확장
-                    // 사용자 로그의 lid_mean: 12.9, lid_low: 14.6 케이스를 구제하기 위해
-                    // lid_low 근처에서도 stall_streak이 쌓이면 확장을 고려할 수 있습니다.
-                    trigger_up = true;
-                    mult = 1.2f; // 완만한 확장
-                }
-
-                if (trigger_up) {
-                    size_t next_ef = (size_t)std::ceil((double)ef_cur * (double)mult);
-                    if (next_ef <= ef_cur) next_ef = ef_cur + 1;
-                    size_t final_ef = std::min(next_ef, ef_max);
-
-                    std::cout << "UP: pop=" << pop_count << " ef " << ef_cur << "->" << final_ef
-                            << " lid=" << lid_mean << " ratio=" << ratio << "\n";
-
-                    ef_cur = final_ef;
-                    next_check_pop = pop_count + cooldown_pops;
-                    stall_streak = 0;
-                    continue;
+                    break;
                 }
             }
-
-            // [갈래 3] STAY: 정체가 없거나 중립 구간일 경우 현재 ef 유지
-            next_check_pop = pop_count + stall_window_w;
         }
 
         visited_list_pool_->releaseVisitedList(vl);
