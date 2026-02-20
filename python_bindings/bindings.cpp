@@ -592,6 +592,8 @@ py::object knnQueryAdaptive(
 
         hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
         dist_t* data_numpy_d = new dist_t[rows * k];
+        size_t* data_numpy_reduced_steps = new size_t[rows];
+        std::atomic<size_t> total_stop_count(0);
 
         {
             // Preallocate normalization buffer per-thread (as in fast path)
@@ -610,7 +612,7 @@ py::object knnQueryAdaptive(
                 }
 
                 hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
-                auto result = appr_alg->searchBaseLayerAdaptive(
+                auto adaptive_output = appr_alg->searchBaseLayerAdaptive(
                     ep, query_ptr, k,
                     ef_init, ef_max, ef_min,
                     tmin_pops, lid_window_k, stall_window_w,
@@ -619,6 +621,9 @@ py::object knnQueryAdaptive(
                     up_soft_mult, cooldown_pops, hard_stall_streak,
                     enable_stop
                 );
+                auto result = std::move(adaptive_output.result);
+                data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
+                total_stop_count.fetch_add(adaptive_output.stats.stop_count, std::memory_order_relaxed);
 
                 for (int i = (int)k - 1; i >= 0; i--) {
                     if (!result.empty()) {
@@ -632,6 +637,7 @@ py::object knnQueryAdaptive(
 
         py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
         py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+        py::capsule free_when_done_reduced(data_numpy_reduced_steps, [](void* f) { delete[] (size_t*)f; });
 
         return py::make_tuple(
             py::array_t<hnswlib::labeltype>(
@@ -645,7 +651,14 @@ py::object knnQueryAdaptive(
                 { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) },
                 data_numpy_d,
                 free_when_done_d
-            )
+            ),
+            py::array_t<size_t>(
+                { rows },
+                { (ssize_t)sizeof(size_t) },
+                data_numpy_reduced_steps,
+                free_when_done_reduced
+            ),
+            py::int_(total_stop_count.load(std::memory_order_relaxed))
         );
     }
 

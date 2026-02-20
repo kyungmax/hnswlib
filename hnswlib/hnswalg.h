@@ -181,6 +181,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     };
 
+    struct AdaptiveSearchStats {
+        size_t reduced_steps = 0;  // max(ef_init - pop_count, 0) when early-stop fires
+        size_t stop_count = 0;     // 1 if early-stop fired, otherwise 0
+    };
+
+    struct AdaptiveSearchResult {
+        std::priority_queue<std::pair<dist_t, labeltype>> result;
+        AdaptiveSearchStats stats;
+    };
+
 
     void setEf(size_t ef) {
         ef_ = ef;
@@ -540,7 +550,7 @@ getLayer0NeighborsWithDistances() const {
     // 4) Separate stall thresholds: dist_stall_up (strict) vs dist_stall_stop (looser).
     // 5) Robust divide-by-zero and monotonicity guards.
 
-    std::priority_queue<std::pair<dist_t, labeltype>>
+    AdaptiveSearchResult
     searchBaseLayerAdaptive(
         tableint ep_id,
         const void *data_point,
@@ -635,6 +645,8 @@ getLayer0NeighborsWithDistances() const {
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
 
+        bool early_stop_fired = false;
+
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
@@ -725,6 +737,7 @@ getLayer0NeighborsWithDistances() const {
                               << " early_lid_mean=" << early_lid_mean
                               << " ef=" << ef_cur << std::endl;
 
+                    early_stop_fired = true;
                     break;
                 }
             }
@@ -739,7 +752,12 @@ getLayer0NeighborsWithDistances() const {
             result.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
             top_candidates.pop();
         }
-        return result;
+
+        AdaptiveSearchResult output;
+        output.result = std::move(result);
+        output.stats.stop_count = early_stop_fired ? 1 : 0;
+        output.stats.reduced_steps = early_stop_fired ? ((pop_count < ef_init) ? (ef_init - pop_count) : 0) : 0;
+        return output;
     }
 
     tableint getBaseLayerEntry(const void* query) const {
