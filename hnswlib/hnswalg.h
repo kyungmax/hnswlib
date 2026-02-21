@@ -541,15 +541,6 @@ getLayer0NeighborsWithDistances() const {
         return {path_info, total_dist_count};
     }
 
-    // ===== Adaptive Beam Search (Final: cooldown + soft/hard up + early-stop) =====
-    //
-    // Key changes vs your previous version:
-    // 1) Cooldown is based on pop_count (not heap size). We only re-check after cooldown_pops.
-    // 2) UP is soft (×up_soft_mult) by default, but hard (×2.0) if (lid_mean >= lid_high2) OR (stall streak >= hard_stall_streak).
-    // 3) DOWN is replaced with true early termination (break) under (stall_stop && low-LID).
-    // 4) Separate stall thresholds: dist_stall_up (strict) vs dist_stall_stop (looser).
-    // 5) Robust divide-by-zero and monotonicity guards.
-
     AdaptiveSearchResult
     searchBaseLayerAdaptive(
         tableint ep_id,
@@ -561,21 +552,15 @@ getLayer0NeighborsWithDistances() const {
         size_t tmin_pops,
         size_t lid_window_k,
         size_t stall_window_w,
-
-        // LID thresholds (absolute LID values recommended; e.g., q25/q75/q90)
-        float  lid_low,     // e.g., q25
-        float  lid_high,    // e.g., q75
-        float  lid_high2,   // e.g., q90  (hard-trigger)
-
-        // Stall thresholds (relative improvement over window)
-        float  dist_stall_stop_early,    // strict stall (e.g., 0.0003) (repurposed as early_slope_threshold)
-        float  dist_stall_stop,  // looser stall for stop (e.g., 0.003)
-
-        // Control params
-        float  up_soft_mult,      // e.g., 1.4
-        size_t cooldown_pops,     // e.g., stall_window_w (or 2*stall_window_w)
-        int    hard_stall_streak, // e.g., 2
-        bool   enable_stop        // formerly enable_down; now means enable early-stop
+        float  lid_low,
+        float  lid_high,
+        float  lid_high2,
+        float  dist_stall_stop_early,
+        float  dist_stall_stop,
+        float  up_soft_mult,
+        size_t cooldown_pops,
+        int    hard_stall_streak,
+        bool   enable_stop
     ) const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
         ef_cur = std::min(ef_cur, ef_max);
@@ -586,27 +571,7 @@ getLayer0NeighborsWithDistances() const {
         // AND the mean LID in that short window is low, we early-terminate (break).
         static constexpr size_t FILL_DELTA_POPS = 20;
 
-        // ============================================================
-        // Data-driven stop schedule (regression from ef=64/128/256/512):
-        //
-        // 1) EASY signal threshold on s_rel (fill -> fill+20):
-        //    Empirically, the "safe" s_rel threshold decreases as ef_init increases.
-        //    A simple linear fit that matches our glove-200-angular trajectories:
-        //
-        //      s_rel_th(ef) ≈ 0.46 - 0.00032 * ef
-        //
-        //    Clamp to a sane range to avoid extreme values.
-        //
-        // 2) Deferred stop pop target:
-        //    Fixed pop=60 worked for ef=128 but breaks for larger ef (e.g., ef=512).
-        //    Empirically, a good schedule is ~ef/2 with a minimum of 30.
-        //
-        //      TARGET_STOP_POP(ef) = max(30, ef/2)
-        //
-        // NOTE: We still keep the API parameters (dist_stall_stop_early, dist_stall_stop, lid_low)
-        // to allow manual override. If dist_stall_stop_early > 0, we use it as an override;
-        // otherwise we use the regression value.
-        // ============================================================
+        // Data-driven easy-stop threshold (regression from ef=64/128/256/512). Override if dist_stall_stop_early > 0.
 
         const float s_rel_th_reg = std::max(0.25f, std::min(0.45f, 0.46f - 0.00032f * (float)ef_init));
         const float s_rel_th = (dist_stall_stop_early > 0.0f) ? dist_stall_stop_early : 0.9*s_rel_th_reg;
@@ -621,8 +586,6 @@ getLayer0NeighborsWithDistances() const {
 
         bool stop_done = false;  // ensure we evaluate at most once
         bool defer_stop = false;         // whether we plan to stop later
-        double early_s_rel = -1.0;        // cached s_rel measured at fill+10
-        double early_lid_mean = 0.0;      // cached lid_mean measured at fill+10
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -640,12 +603,12 @@ getLayer0NeighborsWithDistances() const {
         dist_t lowerBound = dist;
 
         size_t pop_count = 0;
+        bool did_adaptive_stop = false;
 
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
 
-        bool early_stop_fired = false;
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
@@ -712,34 +675,24 @@ getLayer0NeighborsWithDistances() const {
 
                         const double lid_mean = (lid_cnt_fill > 0) ? (lid_sum_fill / (double)lid_cnt_fill) : 0.0;
 
-                        // Cache for possible deferred stop.
-                        early_s_rel = s_rel;
-                        early_lid_mean = lid_mean;
+                            // Decision:
+                            // - If the early signal is strong, mark for stop at ~60 pops.
+                            //   (We only actually stop at pop_count >= TARGET_STOP_POP.)
 
-                        // Decision:
-                        // - If the early signal is strong, mark for stop at ~60 pops.
-                        //   (We only actually stop at pop_count >= TARGET_STOP_POP.)
-                        const bool lid_ok = (lid_mean <= (double)lid_low);
-
-                        // Mark for stop at TARGET_STOP_POP(ef) pops if early signal is strong.
-                        // Use data-driven s_rel_th threshold (regression or override).
-                        if (lid_ok && s_rel >= (double)s_rel_th) {
-                            defer_stop = true;
-                        }
+                            const bool lid_ok = (lid_mean <= (double)lid_low);
+                            // Mark for stop at TARGET_STOP_POP(ef) pops if early signal is strong.
+                            // Use data-driven s_rel_th threshold (regression or override).
+                            if (lid_ok && s_rel >= (double)s_rel_th) {
+                                defer_stop = true;
+                            }
                     }
                 } // end if (!stop_done)
 
-                // Deferred stop: if the early signal was strong, stop at TARGET_STOP_POP(ef).
-                if (defer_stop && pop_count >= TARGET_STOP_POP) {
-                    std::cout << "EASY_STOP_DEFER: pop=" << pop_count
-                              << " fill_pop=" << fill_pop
-                              << " early_s_rel=" << early_s_rel
-                              << " early_lid_mean=" << early_lid_mean
-                              << " ef=" << ef_cur << std::endl;
-
-                    early_stop_fired = true;
-                    break;
-                }
+                    // Deferred stop: if the early signal was strong, stop at TARGET_STOP_POP(ef).
+                    if (defer_stop && pop_count >= TARGET_STOP_POP) {
+                        did_adaptive_stop = true;
+                        break;
+                    }
             }
         }
 
@@ -754,10 +707,10 @@ getLayer0NeighborsWithDistances() const {
         }
 
         AdaptiveSearchResult output;
-        output.result = std::move(result);
-        output.stats.stop_count = early_stop_fired ? 1 : 0;
-        output.stats.reduced_steps = early_stop_fired ? ((pop_count < ef_init) ? (ef_init - pop_count) : 0) : 0;
-        return output;
+            output.result = std::move(result);
+            output.stats.stop_count = did_adaptive_stop ? 1 : 0;
+            output.stats.reduced_steps = did_adaptive_stop ? ((pop_count < ef_init) ? (ef_init - pop_count) : 0) : 0;
+            return output;
     }
 
     tableint getBaseLayerEntry(const void* query) const {
