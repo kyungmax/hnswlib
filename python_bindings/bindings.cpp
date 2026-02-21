@@ -202,6 +202,7 @@ class Index {
     struct SearchBatchResult {
         py::object paths;
         size_t total_dist_count;
+        py::object closest_dists;
     };
 
     struct PathInfo {
@@ -491,8 +492,8 @@ class Index {
         int num_threads = -1
     ) {
         SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
-        // Python에서 (results, total_dist_count) 형태의 튜플로 받게 됨
-        return py::make_tuple(res.paths, res.total_dist_count);
+        // Python에서 (results, total_dist_count, closest_dists) 형태의 튜플로 받게 됨
+        return py::make_tuple(res.paths, res.total_dist_count, res.closest_dists);
     }
 
 
@@ -510,6 +511,7 @@ class Index {
 
         std::vector<std::vector<hnswlib::SearchStepInfo>> raw_results(rows);
         std::vector<size_t> dist_counts(rows, 0);
+        std::vector<float> closest_dists(rows, std::numeric_limits<float>::infinity());
 
         {
             std::vector<float> norm_array;
@@ -527,9 +529,10 @@ class Index {
                 }
 
                 // C++ 구조체로 결과 수집
-                auto [steps, count] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef);
+                auto [steps, count, closest_dist] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef);
                 raw_results[row] = std::move(steps);
                 dist_counts[row] = count;
+                closest_dists[row] = closest_dist;
             });
         } // gil_scoped_release 소멸 시 GIL 자동 재획득
 
@@ -554,7 +557,11 @@ class Index {
         size_t total_count = 0;
         for (size_t c : dist_counts) total_count += c;
 
-        return {py::cast(std::move(py_results)), total_count};
+        return {
+            py::cast(std::move(py_results)),
+            total_count,
+            py::cast(std::move(closest_dists))
+        };
     }
 
 py::object knnQueryAdaptive(
@@ -1379,7 +1386,9 @@ PYBIND11_PLUGIN(hnswlib) {
                 }
 
                 // C++ 결과 획득
-                auto [steps, count] = index.appr_alg->searchKnnWithLayer0Trace(query_data, ef);
+                auto [steps, count, closest_dist] = index.appr_alg->searchKnnWithLayer0Trace(query_data, ef);
+                (void)count;
+                (void)closest_dist;
 
                 // Python Dict 리스트로 변환 (GIL이 잡혀있는 상태이므로 안전함)
                 std::vector<py::dict> py_steps;

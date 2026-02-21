@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <limits>
+#include <tuple>
 
 namespace hnswlib {
 typedef unsigned int linklistsizeint;
@@ -413,7 +415,7 @@ getLayer0NeighborsWithDistances() const {
         setListCount(ll, sz + 1);
     }
 
-    std::pair<std::vector<SearchStepInfo>, size_t>
+    std::tuple<std::vector<SearchStepInfo>, size_t, dist_t>
     searchBaseLayerSTWithTrace(
         tableint ep_id,
         const void *data_point,
@@ -436,6 +438,7 @@ getLayer0NeighborsWithDistances() const {
         char* ep_data = getDataByInternalId(ep_id);
         dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
         dist_t lowerBound = dist;
+        dist_t min_dist = dist;
         dist_count++; // 카운트 증가
 
         top_candidates.emplace(dist, ep_id);
@@ -484,6 +487,9 @@ getLayer0NeighborsWithDistances() const {
                 if (top_candidates.size() < ef || lowerBound > dist) {
                     candidate_set.emplace(-dist, candidate_id);
                     top_candidates.emplace(dist, candidate_id);
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                    }
 
                     if (top_candidates.size() > ef)
                         top_candidates.pop();
@@ -494,17 +500,19 @@ getLayer0NeighborsWithDistances() const {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return {path_info, dist_count}; // 경로와 카운트 함께 반환
+        return {path_info, dist_count, min_dist}; // 경로, 카운트, 결과셋 최소 거리 반환
     }
 
     // 전체 HNSW 검색 과정을 따르되, base layer의 path만 기록
-    std::pair<std::vector<SearchStepInfo>, size_t>
+    std::tuple<std::vector<SearchStepInfo>, size_t, dist_t>
     searchKnnWithLayer0Trace(
         const void *query_data,
         size_t ef
     ) const {
         size_t total_dist_count = 0;
-        if (cur_element_count == 0) return {std::vector<SearchStepInfo>(), 0};
+        if (cur_element_count == 0) {
+            return {std::vector<SearchStepInfo>(), 0, std::numeric_limits<dist_t>::infinity()};
+        }
 
         // 1. Top layer → Layer 1 탐색 (Greedy)
         tableint currObj = enterpoint_node_;
@@ -535,10 +543,10 @@ getLayer0NeighborsWithDistances() const {
 
         // 2. Base layer 탐색 (상세 정보 포함)
         // searchBaseLayerSTWithTrace는 이미 std::vector<SearchStepInfo>를 반환하도록 작성됨
-        auto [path_info, base_dist_count] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
+        auto [path_info, base_dist_count, closest_dist] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
         total_dist_count += base_dist_count;
 
-        return {path_info, total_dist_count};
+        return {path_info, total_dist_count, closest_dist};
     }
 
     AdaptiveSearchResult
