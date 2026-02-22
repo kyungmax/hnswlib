@@ -573,152 +573,138 @@ getLayer0NeighborsWithDistances() const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
         ef_cur = std::min(ef_cur, ef_max);
 
-        // ===== One-shot EASY stop detector (fill -> fill+20) =====
-        // Detect when the result set becomes full (size reaches ef_init), then
-        // measure lowerBound improvement after 20 more pops. If improvement is large
-        // AND the mean LID in that short window is low, we early-terminate (break).
-        static constexpr size_t FILL_DELTA_POPS = 20;
-
-        // Data-driven easy-stop threshold (regression from ef=64/128/256/512). Override if dist_stall_stop_early > 0.
-
-        const float s_rel_th_reg = std::max(0.25f, std::min(0.45f, 0.46f - 0.00032f * (float)ef_init));
-        const float s_rel_th = (dist_stall_stop_early > 0.0f) ? dist_stall_stop_early : 0.9*s_rel_th_reg;
-
-        const size_t TARGET_STOP_POP = std::max<size_t>(30, ef_init / 2);
+        // [최적화 공식]
+        static constexpr size_t FILL_DELTA_POPS = 10;
+        const float s_rel_th_base = 0.26f - 0.00018f * (float)ef_init;
+        const float s_rel_th = (dist_stall_stop_early > 0.0f) ? dist_stall_stop_early : s_rel_th_base;
+        const size_t TARGET_STOP_POP = std::max<size_t>(30, ef_init / 4);
 
         bool fill_seen = false;
         size_t fill_pop = 0;
         dist_t dist_fill = (dist_t)0;
-        double lid_sum_fill = 0.0;
-        size_t lid_cnt_fill = 0;
+        bool stop_done = false;
+        bool defer_stop = false;
 
-        bool stop_done = false;  // ensure we evaluate at most once
-        bool defer_stop = false;         // whether we plan to stop later
-
+        // 1. Visited List 설정 (기존 최적화)
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>,
-                            std::vector<std::pair<dist_t, tableint>>,
-                            CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
-        std::priority_queue<std::pair<dist_t, tableint>,
-                            std::vector<std::pair<dist_t, tableint>>,
-                            CompareByFirst> candidate_set;
-
-        dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
-        dist_t lowerBound = dist;
+        // 2. Entry Point 초기화 (Deleted 체크 최적화 반영)
+        dist_t lowerBound;
+        if (!isMarkedDeleted(ep_id)) {
+            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            top_candidates.emplace(dist, ep_id);
+            lowerBound = dist;
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+        visited_array[ep_id] = visited_array_tag;
 
         size_t pop_count = 0;
         bool did_adaptive_stop = false;
 
-        top_candidates.emplace(dist, ep_id);
-        candidate_set.emplace(-dist, ep_id);
-        visited_array[ep_id] = visited_array_tag;
-
-
+        // 3. 메인 탐색 루프
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
 
-            // Standard HNSW termination condition
             if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
 
             candidate_set.pop();
             tableint curr_id = current_node_pair.second;
-
             pop_count++;
 
-            // ---- 2) Neighbor Expansion (standard) ----
-            linklistsizeint *ll = get_linklist0(curr_id);
-            size_t size = getListCount(ll);
-            tableint *data = (tableint *)(ll + 1);
+            // [기존 최적화 반영] Link list 접근 및 SSE Prefetching
+            int *data = (int*)get_linklist0(curr_id);
+            size_t size = getListCount((linklistsizeint*)data);
+            tableint *datal = (tableint *) (data + 1);
+
+    #ifdef USE_SSE
+            // 다음 노드와 방문 배열 미리 읽기
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
+            _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+    #endif
 
             for (size_t j = 0; j < size; j++) {
-                tableint cand_id = data[j];
+                tableint cand_id = *(datal + j);
+    #ifdef USE_SSE
+                // 다음 이웃 데이터 미리 읽기
+                if (j + 1 < size) {
+                    _mm_prefetch((char *) (visited_array + *(datal + j + 1)), _MM_HINT_T0);
+                    _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
+                }
+    #endif
                 if (visited_array[cand_id] == visited_array_tag) continue;
                 visited_array[cand_id] = visited_array_tag;
 
                 dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
                 if (top_candidates.size() < ef_cur || lowerBound > d) {
                     candidate_set.emplace(-d, cand_id);
-                    top_candidates.emplace(d, cand_id);
+    #ifdef USE_SSE
+                    _mm_prefetch(getDataByInternalId(candidate_set.top().second), _MM_HINT_T0);
+    #endif
+                    // [기존 최적화 반영] 삭제된 노드는 결과셋에서 제외
+                    if (!isMarkedDeleted(cand_id))
+                        top_candidates.emplace(d, cand_id);
 
                     if (top_candidates.size() > ef_cur) top_candidates.pop();
                     if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
                 }
             }
 
-            // ===== One-shot EASY stop detector: fill -> fill+20 =====
-            if (enable_stop) {
-                // One-time measurement logic runs only until we evaluate at fill_pop + FILL_DELTA_POPS.
-                if (!stop_done) {
-                    // (a) Detect first time the result set is "full enough" (reaches ef_init).
-                    // Note: ef_cur starts as ef_init; we detect fill before any stop triggers.
-                    if (!fill_seen && top_candidates.size() >= ef_init) {
-                        fill_seen = true;
-                        fill_pop = pop_count;
-                        dist_fill = lowerBound;
+            // 4. 조기 종료 판단 (LID 계산 오버헤드 최소화 버전)
+            if (enable_stop && !stop_done) {
+                if (!fill_seen && top_candidates.size() >= ef_init) {
+                    fill_seen = true;
+                    fill_pop = pop_count;
+                    dist_fill = lowerBound;
+                }
 
-                        // reset window accumulators
-                        lid_sum_fill = 0.0;
-                        lid_cnt_fill = 0;
-                    }
+                // 정확히 10 step 후 시점에서 단 한 번만 체크
+                if (fill_seen && pop_count == fill_pop + FILL_DELTA_POPS) {
+                    stop_done = true;
+                    const double denom = std::max<double>((double)std::abs((double)dist_fill), 1e-12);
+                    const double s_rel = (dist_fill - lowerBound) / denom;
 
-                    // (b) Accumulate LID only during the short post-fill window.
-                    if (fill_seen && pop_count >= fill_pop && pop_count <= fill_pop + FILL_DELTA_POPS) {
+                    if (s_rel >= (double)s_rel_th) {
+                        // s_rel 통과 시에만 LID 메모리에 접근 (Short-circuit)
                         float spot_lid = node_lid_.empty() ? 0.0f : node_lid_[curr_id];
-                        lid_sum_fill += (double)spot_lid;
-                        lid_cnt_fill += 1;
+                        if (spot_lid <= (float)lid_low) {
+                            defer_stop = true;
+                        }
                     }
+                }
+            }
 
-                    // (c) Evaluate exactly at fill_pop + 20.
-                    if (fill_seen && pop_count == fill_pop + FILL_DELTA_POPS) {
-                        stop_done = true;
-
-                        const double denom = std::max<double>((double)std::abs((double)dist_fill), 1e-12);
-                        const double delta = (double)dist_fill - (double)lowerBound;
-                        const double s_rel = delta / denom;
-
-                        const double lid_mean = (lid_cnt_fill > 0) ? (lid_sum_fill / (double)lid_cnt_fill) : 0.0;
-
-                            // Decision:
-                            // - If the early signal is strong, mark for stop at ~60 pops.
-                            //   (We only actually stop at pop_count >= TARGET_STOP_POP.)
-
-                            const bool lid_ok = (lid_mean <= (double)lid_low);
-                            // Mark for stop at TARGET_STOP_POP(ef) pops if early signal is strong.
-                            // Use data-driven s_rel_th threshold (regression or override).
-                            if (lid_ok && s_rel >= (double)s_rel_th) {
-                                defer_stop = true;
-                            }
-                    }
-                } // end if (!stop_done)
-
-                    // Deferred stop: if the early signal was strong, stop at TARGET_STOP_POP(ef).
-                    if (defer_stop && pop_count >= TARGET_STOP_POP) {
-                        did_adaptive_stop = true;
-                        break;
-                    }
+            if (defer_stop && pop_count >= TARGET_STOP_POP) {
+                did_adaptive_stop = true;
+                break;
             }
         }
 
         visited_list_pool_->releaseVisitedList(vl);
 
+        // 5. 결과 정리
         while (top_candidates.size() > k) top_candidates.pop();
-
-        std::priority_queue<std::pair<dist_t, labeltype>> result;
+        std::priority_queue<std::pair<dist_t, labeltype>> result_queue;
         while (!top_candidates.empty()) {
-            result.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
+            result_queue.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
             top_candidates.pop();
         }
 
-        AdaptiveSearchResult output;
-            output.result = std::move(result);
-            output.stats.stop_count = did_adaptive_stop ? 1 : 0;
-            output.stats.reduced_steps = did_adaptive_stop ? ((pop_count < ef_init) ? (ef_init - pop_count) : 0) : 0;
-            return output;
+        AdaptiveSearchStats stats;
+        stats.stop_count = did_adaptive_stop ? 1 : 0;
+        stats.reduced_steps = (did_adaptive_stop && ef_cur > pop_count) ? (ef_cur - pop_count) : 0;
+
+        return {result_queue, stats};
     }
 
     tableint getBaseLayerEntry(const void* query) const {

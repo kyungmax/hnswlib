@@ -564,7 +564,7 @@ class Index {
         };
     }
 
-py::object knnQueryAdaptive(
+    py::object knnQueryAdaptive(
         py::object input,
         size_t k = 1,
         size_t ef_init = 128,
