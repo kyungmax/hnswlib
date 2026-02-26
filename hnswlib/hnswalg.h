@@ -358,6 +358,54 @@ getLayer0NeighborsWithDistances() const {
         return adj;
     }
 
+    // ===== Upper-layer adjacency extraction =====
+    //
+    // Returns all directed edges (src_internal, dst_internal, distance) at the
+    // requested level (level >= 1).  Only nodes whose element_levels_[u] >= level
+    // participate.  The caller is responsible for mapping internal IDs to external
+    // labels (same pattern as getLayer0NeighborsWithDistances).
+    //
+    // Memory layout reminder:
+    //   linkLists_[u]  is a contiguous malloc'd block for levels 1..element_levels_[u]
+    //   level lv occupies bytes [(lv-1)*size_links_per_element_ , lv*size_links_per_element_)
+    //   capacity per node per level: maxM_  (NOT maxM0_)
+    //
+    // Thread-safety: read-only, safe to call concurrently with reads but NOT writes.
+    struct UpperLayerEdge {
+        tableint src;
+        tableint dst;
+        float    dist;
+    };
+
+    std::vector<UpperLayerEdge>
+    getUpperLayerEdges(int level) const {
+        if (level <= 0)
+            throw std::runtime_error("getUpperLayerEdges: level must be >= 1 (use getLayer0* for level 0)");
+
+        std::vector<UpperLayerEdge> result;
+
+        // Single-threaded collection; caller (bindings.cpp) parallelises if needed.
+        for (tableint u = 0; u < (tableint)cur_element_count; u++) {
+            if (isMarkedDeleted(u)) continue;
+            if (element_levels_[u] < level) continue;  // node doesn't exist at this level
+
+            linklistsizeint* ll = get_linklist(u, level);
+            int sz = (int)getListCount(ll);
+            tableint* neighbors = (tableint*)(ll + 1);
+            char* u_data = getDataByInternalId(u);
+
+            for (int j = 0; j < sz; j++) {
+                tableint v = neighbors[j];
+                float d = (float)fstdistfunc_(u_data, getDataByInternalId(v), dist_func_param_);
+                result.push_back({u, v, d});
+            }
+        }
+        return result;
+    }
+
+    // Convenience: how many levels does this index have (0-indexed max level)?
+    int getMaxLevel() const { return maxlevel_; }
+
     // hnswalg.h (public, UNSAFE)
     void forcedInsertLayer0Edge(
         tableint from,

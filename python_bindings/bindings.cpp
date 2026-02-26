@@ -407,8 +407,100 @@ class Index {
     	return std::make_tuple(sources, targets, distances);
 	}
 
+    // -------------------------------------------------------------------------
+    // getUpperLayerEdgesParallel(level)
+    //
+    // Same contract as getLayer0EdgesParallel but for upper layers (level >= 1).
+    // Returns (src_labels, dst_labels, distances) as numpy arrays.
+    //
+    // Raises ValueError if level <= 0 or level > maxlevel_.
+    //
+    // Parallelisation strategy:
+    //   Pass 1 (serial)  : compute per-node edge count → prefix-sum offsets.
+    //   Pass 2 (parallel): fill src/dst/dist arrays at pre-assigned positions.
+    //   This is identical to getLayer0EdgesParallel; no lock needed because
+    //   each thread writes to a disjoint slice of the output arrays.
+    // -------------------------------------------------------------------------
+    std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
+    getUpperLayerEdgesParallel(int level) {
+        if (!index_inited)
+            throw std::runtime_error("Index not initialised");
+        if (level <= 0)
+            throw std::runtime_error("getUpperLayerEdgesParallel: level must be >= 1");
+        if (level > appr_alg->maxlevel_)
+            throw std::runtime_error(
+                "getUpperLayerEdgesParallel: requested level " + std::to_string(level) +
+                " exceeds maxlevel_ " + std::to_string(appr_alg->maxlevel_));
 
-    void forcedInsertLayer0Edge(
+        size_t num_nodes = appr_alg->cur_element_count;
+
+        // ------------------------------------------------------------------
+        // Pass 1: serial prefix-sum to compute write offsets.
+        //   Only nodes with element_levels_[u] >= level have edges at this level.
+        // ------------------------------------------------------------------
+        std::vector<size_t> offsets(num_nodes + 1, 0);
+        for (size_t u = 0; u < num_nodes; u++) {
+            if (appr_alg->isMarkedDeleted(u) || appr_alg->element_levels_[u] < level) {
+                offsets[u + 1] = offsets[u];
+                continue;
+            }
+            hnswlib::linklistsizeint* ll = appr_alg->get_linklist(u, level);
+            offsets[u + 1] = offsets[u] + appr_alg->getListCount(ll);
+        }
+        size_t total_edges = offsets[num_nodes];
+
+        // ------------------------------------------------------------------
+        // Allocate output arrays.
+        // ------------------------------------------------------------------
+        py::array_t<hnswlib::labeltype> sources(total_edges);
+        py::array_t<hnswlib::labeltype> targets(total_edges);
+        py::array_t<float>              dists(total_edges);
+
+        auto src_ptr  = sources.mutable_data();
+        auto tgt_ptr  = targets.mutable_data();
+        auto dist_ptr = dists.mutable_data();
+
+        // ------------------------------------------------------------------
+        // Pass 2: parallel fill — each node owns a pre-computed slice.
+        // ------------------------------------------------------------------
+        {
+            py::gil_scoped_release gil;
+            ParallelFor(0, num_nodes, num_threads_default, [&](size_t u, size_t /*tid*/) {
+                if (appr_alg->isMarkedDeleted(u)) return;
+                if (appr_alg->element_levels_[u] < level) return;
+
+                hnswlib::labeltype u_label = appr_alg->getExternalLabel(u);
+                char*              u_data  = appr_alg->getDataByInternalId(u);
+
+                hnswlib::linklistsizeint* ll        = appr_alg->get_linklist(u, level);
+                size_t                    sz        = appr_alg->getListCount(ll);
+                hnswlib::tableint*        neighbors = (hnswlib::tableint*)(ll + 1);
+
+                size_t write_start = offsets[u];
+                for (size_t j = 0; j < sz; j++) {
+                    hnswlib::tableint v = neighbors[j];
+                    size_t pos = write_start + j;
+
+                    src_ptr[pos]  = u_label;
+                    tgt_ptr[pos]  = appr_alg->getExternalLabel(v);
+                    dist_ptr[pos] = (float)appr_alg->fstdistfunc_(
+                        u_data,
+                        appr_alg->getDataByInternalId(v),
+                        appr_alg->dist_func_param_);
+                }
+            });
+        }
+
+        return std::make_tuple(sources, targets, dists);
+    }
+
+    // Convenience: returns the maximum level present in the index (0 if only base layer).
+    int getMaxLevel() {
+        if (!index_inited) return -1;
+        return appr_alg->maxlevel_;
+    }
+
+
         size_t from,
         size_t to,
         bool bidirectional = false
@@ -1365,6 +1457,17 @@ PYBIND11_PLUGIN(hnswlib) {
         )
         .def("get_layer0_edges_parallel",
             &Index<float>::getLayer0EdgesParallel
+        )
+        .def("get_upper_layer_edges_parallel",
+            &Index<float>::getUpperLayerEdgesParallel,
+            py::arg("level"),
+            "Extract directed edges (src_labels, dst_labels, distances) from an upper layer.\n"
+            "level must be >= 1. Use get_layer0_edges_parallel() for level 0.\n"
+            "Raises ValueError if level > get_max_level()."
+        )
+        .def("get_max_level",
+            &Index<float>::getMaxLevel,
+            "Return the maximum level present in the index (0 means only base layer exists)."
         )
         .def("forced_insert_layer0_edge",
             &Index<float>::forcedInsertLayer0Edge,
