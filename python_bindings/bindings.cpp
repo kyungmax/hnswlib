@@ -582,8 +582,15 @@ class Index {
         size_t cooldown_pops = 0,
         int hard_stall_streak = 2,
         bool enable_stop = true,
-        int num_threads = -1
+        int num_threads = -1,
+        // [수정 1] Vanilla와 동일하게 filter 파라미터 추가
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr
     ) {
+        // [수정 2] 빈 인덱스 접근 시 Segfault 방지
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
         if (cooldown_pops == 0) cooldown_pops = stall_window_w;
 
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
@@ -592,7 +599,6 @@ class Index {
         get_input_array_shapes(buffer, &rows, &features);
 
         if (num_threads <= 0) num_threads = num_threads_default;
-        // Small batch: throttle threads for speed (same as fast path)
         if (rows <= (size_t)num_threads * 4) {
             num_threads = 1;
         }
@@ -603,11 +609,14 @@ class Index {
         std::atomic<size_t> total_stop_count(0);
 
         {
-            // Preallocate normalization buffer per-thread (as in fast path)
             std::vector<float> norm_array;
             if (normalize) {
                 norm_array.resize((size_t)num_threads * features);
             }
+
+            // 필터 객체 생성
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
 
             py::gil_scoped_release l;
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
@@ -626,18 +635,21 @@ class Index {
                     lid_low, lid_high, lid_high2,
                     dist_stall_stop_early, dist_stall_stop,
                     up_soft_mult, cooldown_pops, hard_stall_streak,
-                    enable_stop
+                    enable_stop, p_idFilter // [수정 1] 필터 전달
                 );
                 auto result = std::move(adaptive_output.result);
                 data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
                 total_stop_count.fetch_add(adaptive_output.stats.stop_count, std::memory_order_relaxed);
 
+                // [수정 3] 결과셋이 부족할 때 쓰레기값 반환 방지 (Vanilla와 동일한 에러 처리)
+                if (result.size() != k) {
+                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                }
+
                 for (int i = (int)k - 1; i >= 0; i--) {
-                    if (!result.empty()) {
-                        data_numpy_d[row * k + i] = result.top().first;
-                        data_numpy_l[row * k + i] = result.top().second;
-                        result.pop();
-                    }
+                    data_numpy_d[row * k + i] = result.top().first;
+                    data_numpy_l[row * k + i] = result.top().second;
+                    result.pop();
                 }
             });
         }
@@ -647,24 +659,9 @@ class Index {
         py::capsule free_when_done_reduced(data_numpy_reduced_steps, [](void* f) { delete[] (size_t*)f; });
 
         return py::make_tuple(
-            py::array_t<hnswlib::labeltype>(
-                { rows, k },
-                { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) },
-                data_numpy_l,
-                free_when_done_l
-            ),
-            py::array_t<dist_t>(
-                { rows, k },
-                { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) },
-                data_numpy_d,
-                free_when_done_d
-            ),
-            py::array_t<size_t>(
-                { rows },
-                { (ssize_t)sizeof(size_t) },
-                data_numpy_reduced_steps,
-                free_when_done_reduced
-            ),
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
             py::int_(total_stop_count.load(std::memory_order_relaxed))
         );
     }
@@ -1348,7 +1345,8 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("hard_stall_streak") = 2,
             // enable_stop: early termination on (stall_stop && low-LID)
             py::arg("enable_stop") = true,
-            py::arg("num_threads") = -1
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none()
         )
         .def("get_lids", &Index<float>::getLids)
         .def("calc_lids_internal", &Index<float>::calcLidsInternal,
