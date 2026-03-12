@@ -612,6 +612,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                 d["node_label"] = appr_alg->getExternalLabel(s.node_id);
                 d["rs_size"] = s.result_set_size;
                 d["internal_dist"] = s.internal_dist;
+                d["popped_query_dist"] = s.popped_query_dist;
                 // C++ vector를 numpy array로 변환
                 d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
                 py_steps.push_back(d);
@@ -634,18 +635,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         size_t k = 1,
         size_t ef_init = 128,
         size_t ef_max = 1024,
-        size_t ef_min = 64,
         size_t tmin_pops = 64,
-        size_t lid_window_k = 20,
-        size_t stall_window_w = 20,
-        float lid_low = 0.0f,
-        float lid_high = 0.0f,
-        float lid_high2 = 0.0f,
-        float dist_stall_stop_early = 0.0003f,
-        float dist_stall_stop = 0.003f,
-        float up_soft_mult = 1.4f,
-        size_t cooldown_pops = 0,
-        int hard_stall_streak = 2,
         bool enable_stop = true,
         int num_threads = -1,
         // [수정 1] Vanilla와 동일하게 filter 파라미터 추가
@@ -655,8 +645,6 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         if (appr_alg->cur_element_count == 0) {
             throw std::runtime_error("Index is empty. Cannot perform search.");
         }
-
-        if (cooldown_pops == 0) cooldown_pops = stall_window_w;
 
         py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
         auto buffer = items.request();
@@ -692,14 +680,10 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                     query_ptr = norm_array.data() + start_idx;
                 }
 
-                hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
-                auto adaptive_output = appr_alg->searchBaseLayerAdaptive(
-                    ep, query_ptr, k,
-                    ef_init, ef_max, ef_min,
-                    tmin_pops, lid_window_k, stall_window_w,
-                    lid_low, lid_high, lid_high2,
-                    dist_stall_stop_early, dist_stall_stop,
-                    up_soft_mult, cooldown_pops, hard_stall_streak,
+                auto adaptive_output = appr_alg->searchKnnAdaptive(
+                    query_ptr, k,
+                    ef_init, ef_max,
+                    tmin_pops,
                     enable_stop, p_idFilter // [수정 1] 필터 전달
                 );
                 auto result = std::move(adaptive_output.result);
@@ -728,6 +712,71 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
             py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
             py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
             py::int_(total_stop_count.load(std::memory_order_relaxed))
+        );
+    }
+
+    py::object knnQueryAdaptiveLight(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 128,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        if (rows <= (size_t)num_threads * 4) {
+            num_threads = 1;
+        }
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                auto result = appr_alg->searchKnnAdaptiveLight(query_ptr, k, ef_init, p_idFilter);
+
+                if (result.size() != k) {
+                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                }
+
+                for (int i = (int)k - 1; i >= 0; i--) {
+                    data_numpy_d[row * k + i] = result.top().first;
+                    data_numpy_l[row * k + i] = result.top().second;
+                    result.pop();
+                }
+            });
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d)
         );
     }
 
@@ -1391,25 +1440,16 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("ef_init") = 128,
             py::arg("ef_max") = 1024,
-            py::arg("ef_min") = 64,
             py::arg("tmin_pops") = 64,
-            py::arg("lid_window_k") = 20,
-            py::arg("stall_window_w") = 20,
-            // lid_low/lid_high/lid_high2:
-            // not quantile, absolute value
-            py::arg("lid_low") = 0.25f,
-            py::arg("lid_high") = 0.75f,
-            py::arg("lid_high2") = 0.90f,
-            // Stall thresholds (relative improvement over the last W steps)
-            py::arg("dist_stall_stop_early") = 0.0003f,
-            py::arg("dist_stall_stop") = 0.003f,
-            // UP control
-            py::arg("up_soft_mult") = 1.4f,
-            // cooldown_pops=0 means "use stall_window_w"
-            py::arg("cooldown_pops") = 0,
-            py::arg("hard_stall_streak") = 2,
-            // enable_stop: early termination on (stall_stop && low-LID)
             py::arg("enable_stop") = true,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none()
+        )
+        .def("knn_query_adaptive_light",
+            &Index<float>::knnQueryAdaptiveLight,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none()
         )
@@ -1463,6 +1503,7 @@ PYBIND11_PLUGIN(hnswlib) {
                     py::dict d;
                     d["node_label"] = index.appr_alg->getExternalLabel(s.node_id);
                     d["rs_size"] = s.result_set_size;
+                    d["popped_query_dist"] = s.popped_query_dist;
                     d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
                     py_steps.push_back(d);
                 }

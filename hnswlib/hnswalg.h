@@ -191,6 +191,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     struct AdaptiveSearchResult {
         std::priority_queue<std::pair<dist_t, labeltype>> result;
         AdaptiveSearchStats stats;
+        std::vector<SearchStepInfo> path_info;
     };
 
 
@@ -458,9 +459,10 @@ getLayer0NeighborsWithDistances() const {
             tableint current_node_id = current_node_pair.second;
 
             // ✅ Record popped node only in path for trace
-            SearchStepInfo step;
+            SearchStepInfo step{};
             step.node_id = current_node_id;
             step.result_set_size = top_candidates.size();
+            step.popped_query_dist = (float)candidate_dist;
 
             if (!top_candidates.empty()) {
                 // top_candidates는 max-heap이므로 top()이 가장 먼(furthest) 요소임
@@ -549,58 +551,54 @@ getLayer0NeighborsWithDistances() const {
         return {path_info, total_dist_count, closest_dist};
     }
 
-    AdaptiveSearchResult
-    searchBaseLayerAdaptive(
+template <bool collect_stats, bool collect_trace>
+    std::priority_queue<std::pair<dist_t, labeltype>>
+    searchBaseLayerAdaptiveCore(
         tableint ep_id,
         const void *data_point,
         size_t k,
         size_t ef_init,
         size_t ef_max,
-        size_t ef_min,
         size_t tmin_pops,
-        size_t lid_window_k,
-        size_t stall_window_w,
-        float  lid_low,
-        float  lid_high,
-        float  lid_high2,
-        float  dist_stall_stop_early,
-        float  dist_stall_stop,
-        float  up_soft_mult,
-        size_t cooldown_pops,
-        int    hard_stall_streak,
         bool   enable_stop,
-        BaseFilterFunctor* isIdAllowed = nullptr // [수정 1] 필터 파라미터 추가
+        BaseFilterFunctor* isIdAllowed,
+        AdaptiveSearchStats* stats,
+        std::vector<SearchStepInfo>* path_info
     ) const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
         ef_cur = std::min(ef_cur, ef_max);
+        size_t dim = 0;
+        if constexpr (collect_trace) {
+            dim = *((size_t *) dist_func_param_);
+        }
 
-        dist_t  cum_dist_red  = 0.0f;
-        int     consec_zeros  = 0;
-        dist_t  prev_check_lb = 0.0f;
-        size_t  next_check_pop = 0;
-        bool    filled_once   = false;
-        dist_t  dist_at_fill   = 0.0f; 
+        // ============================================================
+        // [PoC] 변수 초기화
+        // ============================================================
+        bool should_early_stop = false;
+        int full_pop_count = 0; // result_set이 가득 찬 이후의 진행 스텝(pop) 수
+
+        float best_dist_so_far = std::numeric_limits<float>::max();
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        // [수정 2] -dist 대신 std::greater를 사용하여 0의 오버헤드로 깔끔한 Min-Heap 구현
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, std::greater<std::pair<dist_t, tableint>>> candidate_set;
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
             dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
-            // [수정 3] 필터 체크 후 삽입
             if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(ep_id))) {
                 top_candidates.emplace(dist, ep_id);
             }
             lowerBound = dist;
-            candidate_set.emplace(dist, ep_id); // 양수 그대로 삽입
+            best_dist_so_far = dist;
+            candidate_set.emplace(dist, ep_id);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
-            candidate_set.emplace(lowerBound, ep_id); // 양수 그대로 삽입
+            candidate_set.emplace(lowerBound, ep_id);
         }
         visited_array[ep_id] = visited_array_tag;
 
@@ -609,13 +607,27 @@ getLayer0NeighborsWithDistances() const {
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
-            dist_t candidate_dist = current_node_pair.first; // 양수 그대로 추출
+            dist_t candidate_dist = current_node_pair.first;
 
             if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
 
             candidate_set.pop();
             tableint curr_id = current_node_pair.second;
             pop_count++;
+
+            if constexpr (collect_trace) {
+                SearchStepInfo step{};
+                step.node_id = curr_id;
+                step.result_set_size = top_candidates.size();
+                step.popped_query_dist = (float)candidate_dist;
+                if (!top_candidates.empty()) {
+                    tableint furthest_id = top_candidates.top().second;
+                    step.internal_dist = (float)top_candidates.top().first;
+                    float* vec_ptr = (float*)getDataByInternalId(furthest_id);
+                    step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
+                }
+                path_info->push_back(std::move(step));
+            }
 
             int *data = (int*)get_linklist0(curr_id);
             size_t size = getListCount((linklistsizeint*)data);
@@ -640,48 +652,50 @@ getLayer0NeighborsWithDistances() const {
                 visited_array[cand_id] = visited_array_tag;
 
                 dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+
+                if (d < best_dist_so_far) {
+                    best_dist_so_far = d;
+                }
+
                 if (top_candidates.size() < ef_cur || lowerBound > d) {
-                    candidate_set.emplace(d, cand_id); // 양수 삽입
+                    candidate_set.emplace(d, cand_id);
 
                     if (!isMarkedDeleted(cand_id)) {
-                        // [수정 3] 이웃이 필터를 통과해야만 결과셋(top_candidates)에 포함
                         if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(cand_id))) {
                             top_candidates.emplace(d, cand_id);
                         }
                     }
 
-                    if (top_candidates.size() > ef_cur) top_candidates.pop();
+                    if (top_candidates.size() > ef_cur) {
+                        top_candidates.pop();
+                    }
                     if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
                 }
             }
 
             // ============================================================
-            // [Adaptive Early Stop] 휴리스틱 로직 (기존과 동일)
+            // [PoC] CHR V자 반등 기반 Early Stop 하드코딩
             // ============================================================
             if (enable_stop) {
-                if (!filled_once && top_candidates.size() >= ef_init) {
-                    filled_once    = true;
-                    prev_check_lb  = lowerBound;
-                    next_check_pop = pop_count + 10;
-                }
+                // 1) result_set이 꽉 찬 상태에서만 검사 진행
+                if (top_candidates.size() == ef_cur) {
+                    full_pop_count++;
+                    float furthest_dist = (float)top_candidates.top().first;
+                    // furthest_dist가 0이 되는 것을 방지
+                    float current_chr = (float)candidate_dist / std::max(furthest_dist, 1e-6f);
 
-                if (filled_once && pop_count >= next_check_pop) {
-                    next_check_pop = pop_count + 10;
-
-                    const float denom = (prev_check_lb > 1e-9f) ? prev_check_lb : 1e-9f;
-                    const float dr    = (prev_check_lb - (float)lowerBound) / denom;
-                    prev_check_lb     = (float)lowerBound;
-
-                    if (dr >= 0.002f) {
-                        consec_zeros  = 0;
-                        cum_dist_red += dr;
-                    } else {
-                        consec_zeros++;
-                        if (consec_zeros >= 4 && cum_dist_red > 0.35f && pop_count >= tmin_pops) {
-                            did_adaptive_stop = true;
-                            break;
+                    // 2) result_set이 찬 이후 ~ step 25 이내에 CHR이 0.6 미만으로 떨어지는지 확인
+                    if (full_pop_count <= 25) {
+                        if (current_chr < 0.6f) {
+                            should_early_stop = true;
                         }
                     }
+                }
+
+                // 3) 조건을 만족한 성공적인 쿼리는 efSearch 64 수준(pop_count == 64)에서 즉시 탐색 종료
+                if (pop_count == 64 && should_early_stop) {
+                    did_adaptive_stop = true;
+                    break;
                 }
             }
         }
@@ -695,11 +709,93 @@ getLayer0NeighborsWithDistances() const {
             top_candidates.pop();
         }
 
-        AdaptiveSearchStats stats;
-        stats.stop_count = did_adaptive_stop ? 1 : 0;
-        stats.reduced_steps = (did_adaptive_stop && ef_cur > pop_count) ? (ef_cur - pop_count) : 0;
+        if constexpr (collect_stats) {
+            stats->stop_count = did_adaptive_stop ? 1 : 0;
+            stats->reduced_steps = pop_count;
+        }
 
-        return {result_queue, stats};
+        return result_queue;
+    }
+
+
+
+    AdaptiveSearchResult
+    searchBaseLayerAdaptive(
+        tableint ep_id,
+        const void *data_point,
+        size_t k,
+        size_t ef_init,
+        size_t ef_max,
+        size_t tmin_pops,
+        bool   enable_stop,
+        BaseFilterFunctor* isIdAllowed = nullptr
+    ) const {
+        AdaptiveSearchResult output;
+        output.result = searchBaseLayerAdaptiveCore<true, true>(
+            ep_id, data_point, k,
+            ef_init, ef_max,
+            tmin_pops,
+            enable_stop, isIdAllowed, &output.stats, &output.path_info);
+        return output;
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype>>
+    searchBaseLayerAdaptiveLight(
+        tableint ep_id,
+        const void *data_point,
+        size_t k,
+        size_t ef_init = 128,
+        BaseFilterFunctor* isIdAllowed = nullptr
+    ) const {
+        constexpr size_t ef_max = 1024;
+        constexpr size_t tmin_pops = 64;
+        constexpr bool enable_stop = true;
+
+        return searchBaseLayerAdaptiveCore<false, false>(
+            ep_id, data_point, k,
+            ef_init, ef_max,
+            tmin_pops,
+            enable_stop, isIdAllowed, nullptr, nullptr);
+    }
+
+    AdaptiveSearchResult
+    searchKnnAdaptive(
+        const void *query_data,
+        size_t k,
+        size_t ef_init,
+        size_t ef_max,
+        size_t tmin_pops,
+        bool   enable_stop,
+        BaseFilterFunctor* isIdAllowed = nullptr
+    ) const {
+        AdaptiveSearchResult result;
+        if (cur_element_count == 0) {
+            return result;
+        }
+
+        tableint ep = getBaseLayerEntry(query_data);
+        return searchBaseLayerAdaptive(
+            ep, query_data, k,
+            ef_init, ef_max,
+            tmin_pops,
+            enable_stop, isIdAllowed);
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype>>
+    searchKnnAdaptiveLight(
+        const void *query_data,
+        size_t k,
+        size_t ef_init = 128,
+        BaseFilterFunctor* isIdAllowed = nullptr
+    ) const {
+        std::priority_queue<std::pair<dist_t, labeltype>> result;
+        if (cur_element_count == 0) {
+            return result;
+        }
+
+        tableint ep = getBaseLayerEntry(query_data);
+        return searchBaseLayerAdaptiveLight(
+            ep, query_data, k, ef_init, isIdAllowed);
     }
 
     tableint getBaseLayerEntry(const void* query) const {

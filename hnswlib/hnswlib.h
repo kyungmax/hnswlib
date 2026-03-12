@@ -129,6 +129,7 @@ struct SearchStepInfo {
     tableint node_id;               // 현재 방문 중인 내부 노드 ID
     size_t result_set_size;         // 현재 단계의 top_candidates(W) 크기
     float internal_dist;
+    float popped_query_dist;        // 현재 pop된 노드와 query 간 거리
     std::vector<float> furthest_vec; // 현재 결과 집합 중 가장 먼 노드의 벡터
 };
 

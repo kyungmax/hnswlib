@@ -61,30 +61,40 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         labels, dists, reduced_steps, stop_count = self.p.knn_query_adaptive(query, k=self.k, num_threads=1, **kwargs)
         return labels, dists, reduced_steps, stop_count
 
-    def test_adaptive_parameter_gating(self):
-        ef_init, ef_max, ef_min = 128, 512, 64
+    def _run_adaptive_light(self, query: np.ndarray, **kwargs):
+        labels, dists = self.p.knn_query_adaptive_light(query, k=self.k, num_threads=1, **kwargs)
+        return labels, dists
 
-        # ---- Conservative: 확장을 원천 차단 (LID threshold를 매우 높게 설정) ----
+    def test_adaptive_light_matches_default_adaptive(self):
+        full = self._run_adaptive(self.q_boundary)
+        light = self._run_adaptive_light(self.q_boundary)
+
+        np.testing.assert_array_equal(light[0], full[0])
+        np.testing.assert_allclose(light[1], full[1])
+
+    def test_adaptive_light_accepts_custom_ef_init(self):
+        ef_init = 256
+
+        full = self._run_adaptive(self.q_boundary, ef_init=ef_init)
+        light = self._run_adaptive_light(self.q_boundary, ef_init=ef_init)
+
+        np.testing.assert_array_equal(light[0], full[0])
+        np.testing.assert_allclose(light[1], full[1])
+
+    def test_adaptive_parameter_gating(self):
+        ef_init = 128
+
         conservative = dict(
-            ef_init=ef_init, ef_max=ef_max, ef_min=ef_min,
-            tmin_pops=30, lid_window_k=20, stall_window_w=20,
-            lid_low=0.0,
-            lid_high=1000.0,     # 절대값으로 매우 높게 설정
-            lid_high2=2000.0,
-            dist_stall_up=0.0001,
-            dist_stall_stop=0.003,
-            enable_stop=False,   # enable_down -> enable_stop 명칭 변경 반영
+            ef_init=ef_init,
+            ef_max=ef_init,
+            tmin_pops=64,
+            enable_stop=False,
         )
 
-        # ---- Aggressive: 정체 감지 시 즉시 확장 (LID threshold를 매우 낮게 설정) ----
         aggressive = dict(
-            ef_init=ef_init, ef_max=ef_max, ef_min=ef_min,
-            tmin_pops=10, lid_window_k=20, stall_window_w=20,
-            lid_low=0.0,
-            lid_high=-10.0,      # 무조건 확장이 일어나도록 낮게 설정
-            lid_high2=-5.0,
-            dist_stall_up=0.1,   # 정체 감지 조건을 매우 느슨하게
-            dist_stall_stop=0.01,
+            ef_init=ef_init,
+            ef_max=512,
+            tmin_pops=10,
             enable_stop=False,
         )
 
@@ -99,9 +109,7 @@ class AdaptiveDebugTestCase(unittest.TestCase):
 
         print(f"\n[Boundary Query] Radius fixed_init={r_init:.6f}, adaptive_cons={r_cons:.6f}, adaptive_aggr={r_aggr:.6f}")
 
-        # Conservative는 확장이 안 되어야 하므로 ef=128과 유사해야 함
         self.assertAlmostEqual(r_cons, r_init, delta=0.05)
-        # Aggressive는 확장이 일어나야 하므로 Conservative보다 결과가 좋아야(Radius가 작아야) 함
         self.assertLessEqual(r_aggr, r_cons + 1e-6)
 
     def test_early_stop_mechanism(self):
@@ -109,13 +117,9 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         ef_init = 128
 
         cfg_stop = dict(
-            ef_init=ef_init, ef_max=512, ef_min=64,
-            tmin_pops=30, lid_window_k=20, stall_window_w=20,
-            lid_low=100.0,         # LID가 낮다고 속이기 위해 threshold를 높게 설정
-            lid_high=500.0,
-            lid_high2=600.0,
-            dist_stall_up=0.0001,
-            dist_stall_stop=0.1,   # 정체가 조금만 생겨도 STOP 하도록
+            ef_init=ef_init,
+            ef_max=512,
+            tmin_pops=30,
             enable_stop=True,
         )
 
