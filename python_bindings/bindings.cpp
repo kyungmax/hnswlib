@@ -740,37 +740,50 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         dist_t* data_numpy_d = new dist_t[rows * k];
 
         {
-            std::vector<float> norm_array;
-            if (normalize) {
-                norm_array.resize((size_t)num_threads * features);
-            }
+            py::gil_scoped_release l;
 
             CustomFilterFunctor idFilter(filter);
             CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
 
-            py::gil_scoped_release l;
-            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                const float* query_ptr = (const float*)items.data(row);
-                if (normalize) {
+            // [최적화] Loop Unswitching: 핫 루프 내부의 분기문을 밖으로 빼냄
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    auto result = appr_alg->searchKnnAdaptiveLight(
+                        (const float*)items.data(row), k, ef_init, p_idFilter);
+
+                    if (result.size() != k) {
+                        throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    }
+
+                    for (int i = (int)k - 1; i >= 0; i--) {
+                        data_numpy_d[row * k + i] = result.top().first;
+                        data_numpy_l[row * k + i] = result.top().second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array((size_t)num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     size_t start_idx = threadId * features;
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
-                    query_ptr = norm_array.data() + start_idx;
-                }
 
-                auto result = appr_alg->searchKnnAdaptiveLight(query_ptr, k, ef_init, p_idFilter);
+                    auto result = appr_alg->searchKnnAdaptiveLight(
+                        (const float*)(norm_array.data() + start_idx), k, ef_init, p_idFilter);
 
-                if (result.size() != k) {
-                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
-                }
+                    if (result.size() != k) {
+                        throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    }
 
-                for (int i = (int)k - 1; i >= 0; i--) {
-                    data_numpy_d[row * k + i] = result.top().first;
-                    data_numpy_l[row * k + i] = result.top().second;
-                    result.pop();
-                }
-            });
+                    for (int i = (int)k - 1; i >= 0; i--) {
+                        data_numpy_d[row * k + i] = result.top().first;
+                        data_numpy_l[row * k + i] = result.top().second;
+                        result.pop();
+                    }
+                });
+            }
         }
 
+        // 작성하신 안전한 메모리 해제 유지 (이게 Baseline보다 낫습니다)
         py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
         py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
 

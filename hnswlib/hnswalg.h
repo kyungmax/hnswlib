@@ -551,7 +551,7 @@ getLayer0NeighborsWithDistances() const {
         return {path_info, total_dist_count, closest_dist};
     }
 
-template <bool collect_stats, bool collect_trace>
+    template <bool bare_bone_search, bool collect_stats, bool collect_trace>
     std::priority_queue<std::pair<dist_t, labeltype>>
     searchBaseLayerAdaptiveCore(
         tableint ep_id,
@@ -585,20 +585,23 @@ template <bool collect_stats, bool collect_trace>
         vl_type visited_array_tag = vl->curV;
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, std::greater<std::pair<dist_t, tableint>>> candidate_set;
+
+        // [최적화 1] Baseline과 동일하게 CompareByFirst를 사용하고 거리를 음수(-dist)로 삽입
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (!isMarkedDeleted(ep_id)) {
+
+        // [최적화 2] bare_bone_search 분기 적용 (조건문 제거)
+        if (bare_bone_search ||
+            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
-            if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(ep_id))) {
-                top_candidates.emplace(dist, ep_id);
-            }
+            top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             best_dist_so_far = dist;
-            candidate_set.emplace(dist, ep_id);
+            candidate_set.emplace(-dist, ep_id); // 음수 삽입
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
-            candidate_set.emplace(lowerBound, ep_id);
+            candidate_set.emplace(-lowerBound, ep_id); // 음수 삽입
         }
         visited_array[ep_id] = visited_array_tag;
 
@@ -607,7 +610,7 @@ template <bool collect_stats, bool collect_trace>
 
         while (!candidate_set.empty()) {
             auto current_node_pair = candidate_set.top();
-            dist_t candidate_dist = current_node_pair.first;
+            dist_t candidate_dist = -current_node_pair.first; // 음수를 다시 양수로 복원
 
             if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
 
@@ -658,12 +661,16 @@ template <bool collect_stats, bool collect_trace>
                 }
 
                 if (top_candidates.size() < ef_cur || lowerBound > d) {
-                    candidate_set.emplace(d, cand_id);
+                    candidate_set.emplace(-d, cand_id); // 음수 삽입
+#ifdef USE_SSE
+                    // [최적화 3] 큐에 넣자마자 해당 후보 노드의 Link-List(offsetLevel0_)를 Prefetch
+                    _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
+#endif
 
-                    if (!isMarkedDeleted(cand_id)) {
-                        if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(cand_id))) {
-                            top_candidates.emplace(d, cand_id);
-                        }
+                    // [최적화 2] bare_bone_search 적용으로 핫 루프 내 런타임 분기 제거
+                    if (bare_bone_search ||
+                        (!isMarkedDeleted(cand_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(cand_id))))) {
+                        top_candidates.emplace(d, cand_id);
                     }
 
                     if (top_candidates.size() > ef_cur) {
@@ -674,25 +681,26 @@ template <bool collect_stats, bool collect_trace>
             }
 
             // ============================================================
-            // [PoC] CHR V자 반등 기반 Early Stop 하드코딩
+            // [PoC] CHR V자 반등 기반 Early Stop 하드코딩 (최적화 버전)
             // ============================================================
             if (enable_stop) {
                 // 1) result_set이 꽉 찬 상태에서만 검사 진행
                 if (top_candidates.size() == ef_cur) {
                     full_pop_count++;
-                    float furthest_dist = (float)top_candidates.top().first;
-                    // furthest_dist가 0이 되는 것을 방지
-                    float current_chr = (float)candidate_dist / std::max(furthest_dist, 1e-6f);
 
-                    // 2) result_set이 찬 이후 ~ step 25 이내에 CHR이 0.6 미만으로 떨어지는지 확인
-                    if (full_pop_count <= 25) {
-                        if (current_chr < 0.6f) {
+                    // 2) 딱 25 스텝 이내일 때만 연산 수행 (불필요한 연산 방지)
+                    if (full_pop_count <= 25 && !should_early_stop) {
+                        float furthest_dist = (float)top_candidates.top().first;
+
+                        // [핵심 최적화] 나눗셈(/)을 곱셈(*)으로 변경 및 std::max 제거
+                        // candidate_dist / furthest_dist < 0.6f  ==>  candidate_dist < furthest_dist * 0.6f
+                        if ((float)candidate_dist < furthest_dist * 0.6f) {
                             should_early_stop = true;
                         }
                     }
                 }
 
-                // 3) 조건을 만족한 성공적인 쿼리는 efSearch 64 수준(pop_count == 64)에서 즉시 탐색 종료
+                // 3) pop_count가 정확히 64일 때만 break 수행
                 if (pop_count == 64 && should_early_stop) {
                     did_adaptive_stop = true;
                     break;
@@ -717,8 +725,7 @@ template <bool collect_stats, bool collect_trace>
         return result_queue;
     }
 
-
-
+    template <bool bare_bone_search>
     AdaptiveSearchResult
     searchBaseLayerAdaptive(
         tableint ep_id,
@@ -731,7 +738,7 @@ template <bool collect_stats, bool collect_trace>
         BaseFilterFunctor* isIdAllowed = nullptr
     ) const {
         AdaptiveSearchResult output;
-        output.result = searchBaseLayerAdaptiveCore<true, true>(
+        output.result = searchBaseLayerAdaptiveCore<bare_bone_search, true, true>(
             ep_id, data_point, k,
             ef_init, ef_max,
             tmin_pops,
@@ -739,6 +746,7 @@ template <bool collect_stats, bool collect_trace>
         return output;
     }
 
+    template <bool bare_bone_search>
     std::priority_queue<std::pair<dist_t, labeltype>>
     searchBaseLayerAdaptiveLight(
         tableint ep_id,
@@ -751,7 +759,7 @@ template <bool collect_stats, bool collect_trace>
         constexpr size_t tmin_pops = 64;
         constexpr bool enable_stop = true;
 
-        return searchBaseLayerAdaptiveCore<false, false>(
+        return searchBaseLayerAdaptiveCore<bare_bone_search, false, false>(
             ep_id, data_point, k,
             ef_init, ef_max,
             tmin_pops,
@@ -774,11 +782,22 @@ template <bool collect_stats, bool collect_trace>
         }
 
         tableint ep = getBaseLayerEntry(query_data);
-        return searchBaseLayerAdaptive(
-            ep, query_data, k,
-            ef_init, ef_max,
-            tmin_pops,
-            enable_stop, isIdAllowed);
+
+        // [최적화 2] 런타임에 bare_bone 여부를 판단하여 템플릿 분기
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            return searchBaseLayerAdaptive<true>(
+                ep, query_data, k,
+                ef_init, ef_max,
+                tmin_pops,
+                enable_stop, isIdAllowed);
+        } else {
+            return searchBaseLayerAdaptive<false>(
+                ep, query_data, k,
+                ef_init, ef_max,
+                tmin_pops,
+                enable_stop, isIdAllowed);
+        }
     }
 
     std::priority_queue<std::pair<dist_t, labeltype>>
@@ -794,8 +813,16 @@ template <bool collect_stats, bool collect_trace>
         }
 
         tableint ep = getBaseLayerEntry(query_data);
-        return searchBaseLayerAdaptiveLight(
-            ep, query_data, k, ef_init, isIdAllowed);
+
+        // [최적화 2] 런타임에 bare_bone 여부를 판단하여 템플릿 분기
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            return searchBaseLayerAdaptiveLight<true>(
+                ep, query_data, k, ef_init, isIdAllowed);
+        } else {
+            return searchBaseLayerAdaptiveLight<false>(
+                ep, query_data, k, ef_init, isIdAllowed);
+        }
     }
 
     tableint getBaseLayerEntry(const void* query) const {
@@ -823,7 +850,6 @@ template <bool collect_stats, bool collect_trace>
         }
         return currObj;
     }
-
 
 
     /*
