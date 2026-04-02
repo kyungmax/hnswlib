@@ -56,9 +56,10 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         labels, dists = self.p.knn_query(query, k=self.k, num_threads=1)
         return labels, dists
 
-    def _run_adaptive(self, query: np.ndarray, **kwargs):
-        # 최신 바인딩 규격에 맞게 호출
-        labels, dists, reduced_steps, stop_count = self.p.knn_query_adaptive(query, k=self.k, num_threads=1, **kwargs)
+    def _run_adaptive_analysis(self, query: np.ndarray, **kwargs):
+        labels, dists, reduced_steps, stop_count = self.p.knn_query_adaptive_analysis(
+            query, k=self.k, num_threads=1, **kwargs
+        )
         return labels, dists, reduced_steps, stop_count
 
     def _run_adaptive_light(self, query: np.ndarray, **kwargs):
@@ -66,7 +67,7 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         return labels, dists
 
     def test_adaptive_light_matches_default_adaptive(self):
-        full = self._run_adaptive(self.q_boundary)
+        full = self._run_adaptive_analysis(self.q_boundary)
         light = self._run_adaptive_light(self.q_boundary)
 
         np.testing.assert_array_equal(light[0], full[0])
@@ -75,7 +76,7 @@ class AdaptiveDebugTestCase(unittest.TestCase):
     def test_adaptive_light_accepts_custom_ef_init(self):
         ef_init = 256
 
-        full = self._run_adaptive(self.q_boundary, ef_init=ef_init)
+        full = self._run_adaptive_analysis(self.q_boundary, ef_init=ef_init)
         light = self._run_adaptive_light(self.q_boundary, ef_init=ef_init)
 
         np.testing.assert_array_equal(light[0], full[0])
@@ -98,8 +99,8 @@ class AdaptiveDebugTestCase(unittest.TestCase):
             enable_stop=False,
         )
 
-        _, d_cons, _, _ = self._run_adaptive(self.q_boundary, **conservative)
-        _, d_aggr, _, _ = self._run_adaptive(self.q_boundary, **aggressive)
+        _, d_cons, _, _ = self._run_adaptive_analysis(self.q_boundary, **conservative)
+        _, d_aggr, _, _ = self._run_adaptive_analysis(self.q_boundary, **aggressive)
 
         r_cons = self._radius(d_cons[0])
         r_aggr = self._radius(d_aggr[0])
@@ -124,12 +125,66 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         )
 
         # Easy 쿼리에서 조기 종료가 발생하는지 호출 (충돌 여부 및 유효성 확인)
-        labels, dists, reduced_steps, stop_count = self._run_adaptive(self.q_easy, **cfg_stop)
+        labels, dists, reduced_steps, stop_count = self._run_adaptive_analysis(self.q_easy, **cfg_stop)
 
         self.assertEqual(labels.shape, (1, self.k))
         self.assertTrue(np.all(np.isfinite(dists)))
         self.assertTrue(np.all(reduced_steps >= 0))
         self.assertGreaterEqual(int(stop_count), 0)
+
+    def test_analysis_stop_step_caps_pop_count(self):
+        labels, dists, reduced_steps, stop_count = self._run_adaptive_analysis(
+            self.q_boundary,
+            ef_init=128,
+            ef_max=512,
+            tmin_pops=64,
+            enable_stop=False,
+            stop_step=64,
+        )
+
+        self.assertEqual(labels.shape, (1, self.k))
+        self.assertTrue(np.all(np.isfinite(dists)))
+        self.assertEqual(int(reduced_steps[0]), 64)
+        self.assertEqual(int(stop_count), 0)
+
+    def test_direct_mean_threshold_changes_analysis_behavior(self):
+        base_cfg = dict(
+            ef_init=128,
+            ef_max=512,
+            tmin_pops=25,
+            early_stop_ratio=0.0,
+            easy_stag_limit=1,
+            hard_stag_limit=100000,
+            enable_stop=True,
+        )
+
+        _, d_no_rescue, reduced_no_rescue, stop_no_rescue = self._run_adaptive_analysis(
+            self.q_easy,
+            **base_cfg,
+        )
+        rescue_cfg = dict(base_cfg)
+        rescue_cfg["early_stop_ratio"] = 1.0
+        _, d_rescue, reduced_rescue, stop_rescue = self._run_adaptive_analysis(
+            self.q_easy,
+            **rescue_cfg,
+        )
+
+        self.assertTrue(np.all(np.isfinite(d_no_rescue)))
+        self.assertTrue(np.all(np.isfinite(d_rescue)))
+        self.assertEqual(int(stop_no_rescue), 0)
+        self.assertEqual(int(stop_rescue), 1)
+        self.assertLess(int(reduced_rescue[0]), int(reduced_no_rescue[0]))
+
+        labels_light, dists_light = self._run_adaptive_light(
+            self.q_easy,
+            ef_init=128,
+            early_stop_ratio=1.0,
+            tmin_pops=25,
+            easy_stag_limit=1,
+            hard_stag_limit=100000,
+        )
+        self.assertEqual(labels_light.shape, (1, self.k))
+        self.assertTrue(np.all(np.isfinite(dists_light)))
 
 if __name__ == "__main__":
     unittest.main()

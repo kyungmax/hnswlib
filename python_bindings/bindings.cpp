@@ -211,6 +211,47 @@ class Index {
 
     };
 
+    py::dict searchStepInfoToDict(const hnswlib::SearchStepInfo& s) const {
+        py::dict d;
+        float node_internal_lid = std::numeric_limits<float>::quiet_NaN();
+        if (s.node_id < appr_alg->node_lid_.size()) {
+            node_internal_lid = appr_alg->node_lid_[s.node_id];
+        }
+        d["node_label"] = appr_alg->getExternalLabel(s.node_id);
+        d["node_internal_lid"] = node_internal_lid;
+        d["rs_size"] = s.result_set_size;
+        d["rs_size_after"] = s.result_set_size_after;
+        d["is_full_pop_after"] = s.is_full_pop_after;
+        d["full_pop_count_after"] = s.full_pop_count_after;
+        d["popped_degree"] = s.popped_degree;
+        d["unvisited_neighbor_count"] = s.unvisited_neighbor_count;
+        d["accepted_neighbor_count"] = s.accepted_neighbor_count;
+        d["runtime_accepted_rate"] = s.runtime_accepted_rate;
+        d["runtime_chr"] = s.runtime_chr;
+        d["runtime_smoothed_chr"] = s.runtime_smoothed_chr;
+        d["runtime_classify_chr_mean"] = s.runtime_classify_chr_mean;
+        d["runtime_classification_evaluated"] = s.runtime_classification_evaluated;
+        d["runtime_is_easy_query"] = s.runtime_is_easy_query;
+        d["runtime_is_super_easy_query"] = s.runtime_is_super_easy_query;
+        d["runtime_is_mid_easy_query"] = s.runtime_is_mid_easy_query;
+        d["runtime_rebased_after_shrink"] = s.runtime_rebased_after_shrink;
+        d["runtime_effective_ef"] = s.runtime_effective_ef;
+        d["runtime_stagnation_count"] = s.runtime_stagnation_count;
+        d["runtime_applied_patience"] = s.runtime_applied_patience;
+        d["internal_dist"] = s.internal_dist;
+        d["popped_query_dist"] = s.popped_query_dist;
+        d["furthest_dist"] = s.furthest_dist;
+        d["best_dist"] = s.best_dist;
+        d["top_k_dist"] = s.top_k_dist;
+        d["ef_half_dist"] = s.ef_half_dist;
+        d["ef_quarter_dist"] = s.ef_quarter_dist;
+        d["sqrt_ef_dist"] = s.sqrt_ef_dist;
+        d["top_2k_dist"] = s.top_2k_dist;
+        d["top_3k_dist"] = s.top_3k_dist;
+        d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
+        return d;
+    }
+
     void init_new_index(
         size_t maxElements,
         size_t M,
@@ -546,17 +587,18 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         size_t ef,
         int num_threads = -1
     ) {
-        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads, 10);
         return res.paths;
     }
 
     // [API 2] 신규 API: 거리 계산 횟수 포함 (Tuple[List, int] 반환)
     py::tuple searchLayer0PathBatchWithMetrics(
         py::object input,
+        size_t k,
         size_t ef,
         int num_threads = -1
     ) {
-        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads);
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, k, ef, num_threads);
         // Python에서 (results, total_dist_count, closest_dists) 형태의 튜플로 받게 됨
         return py::make_tuple(res.paths, res.total_dist_count, res.closest_dists);
     }
@@ -564,6 +606,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
 
     SearchBatchResult _searchLayer0PathBatchInternal(
         py::object input,
+        size_t k,
         size_t ef,
         int num_threads
     ) {
@@ -594,7 +637,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                 }
 
                 // C++ 구조체로 결과 수집
-                auto [steps, count, closest_dist] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef);
+                auto [steps, count, closest_dist] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef, k);
                 raw_results[row] = std::move(steps);
                 dist_counts[row] = count;
                 closest_dists[row] = closest_dist;
@@ -608,14 +651,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
             py_steps.reserve(raw_results[i].size());
 
             for (auto& s : raw_results[i]) {
-                py::dict d;
-                d["node_label"] = appr_alg->getExternalLabel(s.node_id);
-                d["rs_size"] = s.result_set_size;
-                d["internal_dist"] = s.internal_dist;
-                d["popped_query_dist"] = s.popped_query_dist;
-                // C++ vector를 numpy array로 변환
-                d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
-                py_steps.push_back(d);
+                py_steps.push_back(searchStepInfoToDict(s));
             }
             py_results[i] = std::move(py_steps);
         }
@@ -630,16 +666,20 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         };
     }
 
-    py::object knnQueryAdaptive(
+    py::object knnQueryAdaptiveAnalysis(
         py::object input,
         size_t k = 1,
         size_t ef_init = 128,
         size_t ef_max = 1024,
         size_t tmin_pops = 64,
         bool enable_stop = true,
+        size_t stop_step = 0,
         int num_threads = -1,
         // [수정 1] Vanilla와 동일하게 filter 파라미터 추가
-        const std::function<bool(hnswlib::labeltype)>& filter = nullptr
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
     ) {
         // [수정 2] 빈 인덱스 접근 시 Segfault 방지
         if (appr_alg->cur_element_count == 0) {
@@ -680,11 +720,16 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                     query_ptr = norm_array.data() + start_idx;
                 }
 
-                auto adaptive_output = appr_alg->searchKnnAdaptive(
+                auto adaptive_output = appr_alg->searchKnnAdaptiveAnalysis(
                     query_ptr, k,
                     ef_init, ef_max,
                     tmin_pops,
-                    enable_stop, p_idFilter // [수정 1] 필터 전달
+                    enable_stop,
+                    stop_step,
+                    p_idFilter,
+                    early_stop_ratio,
+                    super_easy_gamma_ratio,
+                    mid_easy_upper_gamma_ratio
                 );
                 auto result = std::move(adaptive_output.result);
                 data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
@@ -715,12 +760,19 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         );
     }
 
-    py::object knnQueryAdaptiveLight(
+    py::object knnQueryAdaptiveAnalysisWithTrace(
         py::object input,
         size_t k = 1,
         size_t ef_init = 128,
+        size_t ef_max = 1024,
+        size_t tmin_pops = 64,
+        bool enable_stop = true,
+        size_t stop_step = 0,
         int num_threads = -1,
-        const std::function<bool(hnswlib::labeltype)>& filter = nullptr
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
     ) {
         if (appr_alg->cur_element_count == 0) {
             throw std::runtime_error("Index is empty. Cannot perform search.");
@@ -738,9 +790,116 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
 
         hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
         dist_t* data_numpy_d = new dist_t[rows * k];
+        size_t* data_numpy_reduced_steps = new size_t[rows];
+        size_t* data_numpy_stop_flags = new size_t[rows];
+        std::atomic<size_t> total_stop_count(0);
+        std::vector<std::vector<hnswlib::SearchStepInfo>> raw_paths(rows);
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                auto adaptive_output = appr_alg->searchKnnAdaptiveAnalysis(
+                    query_ptr, k,
+                    ef_init, ef_max,
+                    tmin_pops,
+                    enable_stop,
+                    stop_step,
+                    p_idFilter,
+                    early_stop_ratio,
+                    super_easy_gamma_ratio,
+                    mid_easy_upper_gamma_ratio
+                );
+                raw_paths[row] = std::move(adaptive_output.path_info);
+                auto result = std::move(adaptive_output.result);
+                data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
+                data_numpy_stop_flags[row] = adaptive_output.stats.stop_count;
+                total_stop_count.fetch_add(adaptive_output.stats.stop_count, std::memory_order_relaxed);
+
+                if (result.size() != k) {
+                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                }
+
+                for (int i = (int)k - 1; i >= 0; i--) {
+                    data_numpy_d[row * k + i] = result.top().first;
+                    data_numpy_l[row * k + i] = result.top().second;
+                    result.pop();
+                }
+            });
+        }
+
+        std::vector<std::vector<py::dict>> py_paths(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            std::vector<py::dict> py_steps;
+            py_steps.reserve(raw_paths[i].size());
+            for (auto& s : raw_paths[i]) {
+                py_steps.push_back(searchStepInfoToDict(s));
+            }
+            py_paths[i] = std::move(py_steps);
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+        py::capsule free_when_done_reduced(data_numpy_reduced_steps, [](void* f) { delete[] (size_t*)f; });
+        py::capsule free_when_done_stop_flags(data_numpy_stop_flags, [](void* f) { delete[] (size_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_stop_flags, free_when_done_stop_flags),
+            py::int_(total_stop_count.load(std::memory_order_relaxed)),
+            py::cast(std::move(py_paths))
+        );
+    }
+
+    py::object knnQueryAdaptiveLight(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 128,
+        bool enable_stop = true,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        size_t tmin_pops = 25,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
 
         {
             py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            if (num_threads <= 0) num_threads = num_threads_default;
+            if (rows <= (size_t)num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
 
             CustomFilterFunctor idFilter(filter);
             CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
@@ -749,7 +908,16 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
             if (normalize == false) {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     auto result = appr_alg->searchKnnAdaptiveLight(
-                        (const float*)items.data(row), k, ef_init, p_idFilter);
+                        (const float*)items.data(row),
+                        k,
+                        ef_init,
+                        enable_stop,
+                        p_idFilter,
+                        early_stop_ratio,
+                        tmin_pops,
+                        super_easy_gamma_ratio,
+                        mid_easy_upper_gamma_ratio
+                    );
 
                     if (result.size() != k) {
                         throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -768,7 +936,16 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
 
                     auto result = appr_alg->searchKnnAdaptiveLight(
-                        (const float*)(norm_array.data() + start_idx), k, ef_init, p_idFilter);
+                        (const float*)(norm_array.data() + start_idx),
+                        k,
+                        ef_init,
+                        enable_stop,
+                        p_idFilter,
+                        early_stop_ratio,
+                        tmin_pops,
+                        super_easy_gamma_ratio,
+                        mid_easy_upper_gamma_ratio
+                    );
 
                     if (result.size() != k) {
                         throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -1447,24 +1624,48 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
-        .def("knn_query_adaptive",
-            &Index<float>::knnQueryAdaptive,
+        .def("knn_query_adaptive_analysis",
+            &Index<float>::knnQueryAdaptiveAnalysis,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("ef_init") = 128,
             py::arg("ef_max") = 1024,
             py::arg("tmin_pops") = 64,
             py::arg("enable_stop") = true,
+            py::arg("stop_step") = 0,
             py::arg("num_threads") = -1,
-            py::arg("filter") = py::none()
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
+        )
+        .def("knn_query_adaptive_analysis_with_trace",
+            &Index<float>::knnQueryAdaptiveAnalysisWithTrace,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
+            py::arg("ef_max") = 1024,
+            py::arg("tmin_pops") = 64,
+            py::arg("enable_stop") = true,
+            py::arg("stop_step") = 0,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
         )
         .def("knn_query_adaptive_light",
             &Index<float>::knnQueryAdaptiveLight,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("ef_init") = 128,
+            py::arg("enable_stop") = true,
             py::arg("num_threads") = -1,
-            py::arg("filter") = py::none()
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("tmin_pops") = 25,
+            py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
         )
         .def("get_layer_edges_parallel",
             &Index<float>::getLayerEdgesParallel,
@@ -1506,7 +1707,7 @@ PYBIND11_PLUGIN(hnswlib) {
                 }
 
                 // C++ 결과 획득
-                auto [steps, count, closest_dist] = index.appr_alg->searchKnnWithLayer0Trace(query_data, ef);
+                auto [steps, count, closest_dist] = index.appr_alg->searchKnnWithLayer0Trace(query_data, ef, 10);
                 (void)count;
                 (void)closest_dist;
 
@@ -1514,9 +1715,35 @@ PYBIND11_PLUGIN(hnswlib) {
                 std::vector<py::dict> py_steps;
                 for (auto& s : steps) {
                     py::dict d;
+                    float node_internal_lid = std::numeric_limits<float>::quiet_NaN();
+                    if (s.node_id < index.appr_alg->node_lid_.size()) {
+                        node_internal_lid = index.appr_alg->node_lid_[s.node_id];
+                    }
                     d["node_label"] = index.appr_alg->getExternalLabel(s.node_id);
+                    d["node_internal_lid"] = node_internal_lid;
                     d["rs_size"] = s.result_set_size;
+                    d["rs_size_after"] = s.result_set_size_after;
+                    d["is_full_pop_after"] = s.is_full_pop_after;
+                    d["full_pop_count_after"] = s.full_pop_count_after;
+                    d["popped_degree"] = s.popped_degree;
+                    d["unvisited_neighbor_count"] = s.unvisited_neighbor_count;
+                    d["accepted_neighbor_count"] = s.accepted_neighbor_count;
+                    d["runtime_accepted_rate"] = s.runtime_accepted_rate;
+                    d["runtime_chr"] = s.runtime_chr;
+                    d["runtime_smoothed_chr"] = s.runtime_smoothed_chr;
+                    d["runtime_classify_chr_mean"] = s.runtime_classify_chr_mean;
+                    d["runtime_is_easy_query"] = s.runtime_is_easy_query;
+                    d["runtime_is_super_easy_query"] = s.runtime_is_super_easy_query;
+                    d["internal_dist"] = s.internal_dist;
                     d["popped_query_dist"] = s.popped_query_dist;
+                    d["furthest_dist"] = s.furthest_dist;
+                    d["best_dist"] = s.best_dist;
+                    d["top_k_dist"] = s.top_k_dist;
+                    d["ef_half_dist"] = s.ef_half_dist;
+                    d["ef_quarter_dist"] = s.ef_quarter_dist;
+                    d["sqrt_ef_dist"] = s.sqrt_ef_dist;
+                    d["top_2k_dist"] = s.top_2k_dist;
+                    d["top_3k_dist"] = s.top_3k_dist;
                     d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
                     py_steps.push_back(d);
                 }
@@ -1538,6 +1765,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("search_layer0_path_with_dist_metrics_batch",
             &Index<float>::searchLayer0PathBatchWithMetrics,
             py::arg("data"),
+            py::arg("k"),
             py::arg("ef"),
             py::arg("num_threads") = -1
         )

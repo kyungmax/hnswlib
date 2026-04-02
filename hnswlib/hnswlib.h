@@ -128,8 +128,34 @@ typedef unsigned int tableint;
 struct SearchStepInfo {
     tableint node_id;               // 현재 방문 중인 내부 노드 ID
     size_t result_set_size;         // 현재 단계의 top_candidates(W) 크기
+    size_t result_set_size_after;   // 현재 pop step 처리 후 top_candidates(W) 크기
+    bool is_full_pop_after;         // 현재 pop step 처리 후 result set이 ef까지 찼는지 여부
+    size_t full_pop_count_after;    // 현재 pop step 처리 후의 full-pop observation index
+    size_t popped_degree;           // 현재 pop된 노드의 base-layer degree
+    size_t unvisited_neighbor_count; // 현재 pop step에서 처음 본 이웃 수
+    size_t accepted_neighbor_count;  // 현재 pop step에서 candidate/result set에 채택된 이웃 수
+    float runtime_accepted_rate;    // accepted_neighbor_count / unvisited_neighbor_count
+    float runtime_chr;              // raw CHR at the current full-pop step
+    float runtime_smoothed_chr;     // EMA-smoothed CHR at the current full-pop step
+    float runtime_classify_chr_mean; // classify-window smoothed_CHR mean once available
+    bool runtime_classification_evaluated; // classify window가 닫혀 easy/hard 판정이 확정되었는지
+    bool runtime_is_easy_query;     // true_tau threshold로 easy 판정되었는지
+    bool runtime_is_super_easy_query; // super-easy policy selector에 선택되었는지
+    bool runtime_is_mid_easy_query; // 20~50% easy bucket selector에 선택되었는지
+    bool runtime_rebased_after_shrink; // 이번 step에서 shrink 후 furthest/stagnation이 rebase되었는지
+    size_t runtime_effective_ef;    // 현재 step 종료 시점의 effective ef
+    size_t runtime_stagnation_count; // 현재 step 종료 시점의 stagnation count
+    size_t runtime_applied_patience; // 현재 step 종료 시점에 적용된 patience
     float internal_dist;
     float popped_query_dist;        // 현재 pop된 노드와 query 간 거리
+    float furthest_dist;            // 현재 pop step 처리 후 결과 집합의 최외곽 거리
+    float best_dist;                // 현재 pop step 처리 후 결과 집합의 최선 거리
+    float top_k_dist;               // 현재 pop step 처리 후 top-k의 k번째 거리
+    float ef_half_dist;             // 현재 pop step 처리 후 ef/2번째 거리
+    float ef_quarter_dist;          // 현재 pop step 처리 후 ef/4번째 거리
+    float sqrt_ef_dist;             // 현재 pop step 처리 후 sqrt(ef)번째 거리
+    float top_2k_dist;              // 현재 pop step 처리 후 top-2k의 2k번째 거리
+    float top_3k_dist;              // 현재 pop step 처리 후 top-3k의 3k번째 거리
     std::vector<float> furthest_vec; // 현재 결과 집합 중 가장 먼 노드의 벡터
 };
 

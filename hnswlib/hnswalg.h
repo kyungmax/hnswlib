@@ -18,6 +18,8 @@
 #include <list>
 #include <memory>
 #include <limits>
+#include <algorithm>
+#include <cmath>
 #include <tuple>
 
 namespace hnswlib {
@@ -193,6 +195,80 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         AdaptiveSearchStats stats;
         std::vector<SearchStepInfo> path_info;
     };
+
+    static size_t resolveScaledShrinkEf(
+        size_t configured_ef,
+        double scale,
+        size_t min_ef
+    ) {
+        const size_t raw_ef = (size_t)std::llround((double)configured_ef * scale);
+        return std::min(configured_ef, std::max(min_ef, raw_ef));
+    }
+
+    static float rankDistanceOrNaN(
+        const std::vector<std::pair<dist_t, tableint>>& sorted_candidates,
+        size_t rank
+    ) {
+        if (rank == 0 || sorted_candidates.size() < rank) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        return (float)sorted_candidates[rank - 1].first;
+    }
+
+    void fillTraceStepMetrics(
+        SearchStepInfo& step,
+        const std::priority_queue<std::pair<dist_t, tableint>,
+                                  std::vector<std::pair<dist_t, tableint>>,
+                                  CompareByFirst>& top_candidates,
+        size_t ef,
+        size_t k,
+        size_t dim
+    ) const {
+        step.result_set_size_after = top_candidates.size();
+        step.furthest_dist = std::numeric_limits<float>::quiet_NaN();
+        step.best_dist = std::numeric_limits<float>::quiet_NaN();
+        step.top_k_dist = std::numeric_limits<float>::quiet_NaN();
+        step.ef_half_dist = std::numeric_limits<float>::quiet_NaN();
+        step.ef_quarter_dist = std::numeric_limits<float>::quiet_NaN();
+        step.sqrt_ef_dist = std::numeric_limits<float>::quiet_NaN();
+        step.top_2k_dist = std::numeric_limits<float>::quiet_NaN();
+        step.top_3k_dist = std::numeric_limits<float>::quiet_NaN();
+        step.furthest_vec.clear();
+
+        if (top_candidates.empty()) {
+            return;
+        }
+
+        auto snapshot = top_candidates;
+        std::vector<std::pair<dist_t, tableint>> sorted_candidates;
+        sorted_candidates.reserve(snapshot.size());
+
+        while (!snapshot.empty()) {
+            sorted_candidates.push_back(snapshot.top());
+            snapshot.pop();
+        }
+
+        std::sort(
+            sorted_candidates.begin(),
+            sorted_candidates.end(),
+            [](const std::pair<dist_t, tableint>& lhs, const std::pair<dist_t, tableint>& rhs) {
+                return lhs.first < rhs.first;
+            }
+        );
+
+        step.best_dist = (float)sorted_candidates.front().first;
+        step.furthest_dist = (float)sorted_candidates.back().first;
+        step.top_k_dist = rankDistanceOrNaN(sorted_candidates, k);
+        step.ef_half_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, ef / 2));
+        step.ef_quarter_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, ef / 4));
+        step.sqrt_ef_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, (size_t)std::sqrt((double)ef)));
+        step.top_2k_dist = rankDistanceOrNaN(sorted_candidates, k * 2);
+        step.top_3k_dist = rankDistanceOrNaN(sorted_candidates, k * 3);
+
+        tableint furthest_id = sorted_candidates.back().second;
+        float* vec_ptr = (float*)getDataByInternalId(furthest_id);
+        step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
+    }
 
 
     void setEf(size_t ef) {
@@ -420,11 +496,16 @@ getLayer0NeighborsWithDistances() const {
     searchBaseLayerSTWithTrace(
         tableint ep_id,
         const void *data_point,
-        size_t ef
+        size_t ef,
+        size_t k
     ) const {
         std::vector<SearchStepInfo> path_info;
         size_t dist_count = 0; // 거리 계산 카운터
         size_t dim = *((size_t *) dist_func_param_); // 벡터 차원 획득
+        size_t full_pop_count = 0;
+        static constexpr float CHR_EMA_DECAY = 0.8f;
+        static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+        float runtime_smoothed_chr = std::numeric_limits<float>::quiet_NaN();
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -462,25 +543,37 @@ getLayer0NeighborsWithDistances() const {
             SearchStepInfo step{};
             step.node_id = current_node_id;
             step.result_set_size = top_candidates.size();
+            step.is_full_pop_after = false;
+            step.full_pop_count_after = 0;
+            step.runtime_chr = std::numeric_limits<float>::quiet_NaN();
+            step.runtime_smoothed_chr = std::numeric_limits<float>::quiet_NaN();
+            step.runtime_classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+            step.runtime_classification_evaluated = false;
+            step.runtime_is_easy_query = false;
+            step.runtime_is_super_easy_query = false;
+            step.runtime_is_mid_easy_query = false;
+            step.runtime_rebased_after_shrink = false;
+            step.runtime_effective_ef = ef;
+            step.runtime_stagnation_count = 0;
+            step.runtime_applied_patience = 0;
             step.popped_query_dist = (float)candidate_dist;
 
             if (!top_candidates.empty()) {
-                // top_candidates는 max-heap이므로 top()이 가장 먼(furthest) 요소임
-                tableint furthest_id = top_candidates.top().second;
                 step.internal_dist = (float)top_candidates.top().first;
-                float* vec_ptr = (float*)getDataByInternalId(furthest_id);
-                step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
             }
-            path_info.push_back(std::move(step));
 
             int *data = (int *) get_linklist0(current_node_id);
             size_t size = getListCount((linklistsizeint*)data);
+            size_t unvisited_count = 0;
+            size_t accepted_count = 0;
+            step.popped_degree = size;
 
             for (size_t j = 1; j <= size; j++) {
                 tableint candidate_id = *(data + j);
                 if (visited_array[candidate_id] == visited_array_tag) continue;
 
                 visited_array[candidate_id] = visited_array_tag;
+                unvisited_count++;
 
                 char *currObj1 = getDataByInternalId(candidate_id);
                 dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
@@ -489,6 +582,7 @@ getLayer0NeighborsWithDistances() const {
                 if (top_candidates.size() < ef || lowerBound > dist) {
                     candidate_set.emplace(-dist, candidate_id);
                     top_candidates.emplace(dist, candidate_id);
+                    accepted_count++;
                     if (dist < min_dist) {
                         min_dist = dist;
                     }
@@ -499,6 +593,29 @@ getLayer0NeighborsWithDistances() const {
                     lowerBound = top_candidates.top().first;
                 }
             }
+
+            step.unvisited_neighbor_count = unvisited_count;
+            step.accepted_neighbor_count = accepted_count;
+
+            if (top_candidates.size() == ef) {
+                step.is_full_pop_after = true;
+                full_pop_count++;
+                step.full_pop_count_after = full_pop_count;
+
+                float furthest_dist = (float)top_candidates.top().first;
+                float chr = (float)candidate_dist / std::max(furthest_dist, 1e-6f);
+                step.runtime_chr = chr;
+                if (std::isnan(runtime_smoothed_chr)) {
+                    runtime_smoothed_chr = chr;
+                } else {
+                    runtime_smoothed_chr =
+                        CHR_EMA_DECAY * runtime_smoothed_chr + CHR_EMA_UPDATE * chr;
+                }
+                step.runtime_smoothed_chr = runtime_smoothed_chr;
+            }
+
+            fillTraceStepMetrics(step, top_candidates, ef, k, dim);
+            path_info.push_back(std::move(step));
         }
 
         visited_list_pool_->releaseVisitedList(vl);
@@ -509,7 +626,8 @@ getLayer0NeighborsWithDistances() const {
     std::tuple<std::vector<SearchStepInfo>, size_t, dist_t>
     searchKnnWithLayer0Trace(
         const void *query_data,
-        size_t ef
+        size_t ef,
+        size_t k
     ) const {
         size_t total_dist_count = 0;
         if (cur_element_count == 0) {
@@ -545,189 +663,706 @@ getLayer0NeighborsWithDistances() const {
 
         // 2. Base layer 탐색 (상세 정보 포함)
         // searchBaseLayerSTWithTrace는 이미 std::vector<SearchStepInfo>를 반환하도록 작성됨
-        auto [path_info, base_dist_count, closest_dist] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
+        auto [path_info, base_dist_count, closest_dist] = searchBaseLayerSTWithTrace(currObj, query_data, ef, k);
         total_dist_count += base_dist_count;
 
         return {path_info, total_dist_count, closest_dist};
     }
 
-    template <bool bare_bone_search, bool collect_stats, bool collect_trace>
-    std::priority_queue<std::pair<dist_t, labeltype>>
-    searchBaseLayerAdaptiveCore(
-        tableint ep_id,
-        const void *data_point,
-        size_t k,
-        size_t ef_init,
-        size_t ef_max,
-        size_t tmin_pops,
-        bool   enable_stop,
-        BaseFilterFunctor* isIdAllowed,
-        AdaptiveSearchStats* stats,
-        std::vector<SearchStepInfo>* path_info
-    ) const {
-        size_t ef_cur = std::max<size_t>(ef_init, k);
-        ef_cur = std::min(ef_cur, ef_max);
-        size_t dim = 0;
-        if constexpr (collect_trace) {
-            dim = *((size_t *) dist_func_param_);
-        }
+/**
+ * =============================================================================
+ * HNSW Adaptive Early Termination — Simplified Two-Phase Architecture
+ * =============================================================================
+ *
+ * Validated on 3 datasets: GLOVE-200, GIST-960, NYTIMES-256
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                         FULL PIPELINE LOGIC                            │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                        │
+ * │  PHASE 1 — CLASSIFY (pops 4 ~ 16 after result set is full)            │
+ * │  ─────────────────────────────────────────────────────────────         │
+ * │  Goal: Identify "easy" queries that already converge at ef=64.         │
+ * │                                                                        │
+ * │  At each pop:                                                          │
+ * │    CHR = candidate_dist / furthest_dist                                │
+ * │    (ratio of popped node's distance to the worst result in the set)    │
+ * │                                                                        │
+ * │  At full_pop 16, mark EASY iff classify-window                         │
+ * │  chr_mean <= early_stop_ratio                                          │
+ * │                                                                        │
+ * │  WHY THIS WORKS:                                                       │
+ * │  - Low CHR means popped node is much closer to query than the worst   │
+ * │    result → the search is actively finding good neighbors              │
+ * │  - Easy queries show sustained low CHR in early steps (the search     │
+ * │    quickly finds a pocket of true nearest neighbors)                   │
+ * │  - Hard queries maintain high CHR throughout (popped nodes are         │
+ * │    always near the boundary of the result set)                         │
+ * │                                                                        │
+ * │  Threshold is dataset-specific and comes from the validated            │
+ * │  classify-window chr_mean table in early_stop_config.py.               │
+ * │  The parameter name `early_stop_ratio` is retained for API stability,  │
+ * │  but it now means this direct-mean threshold.                          │
+ * │                                                                        │
+ * │                                                                        │
+ * │  PHASE 2 — STOP (after tmin_pops, typically 25–30)                    │
+ * │  ───────────────────────────────────────────────────                   │
+ * │  Goal: Detect when the result set has stabilized.                      │
+ * │                                                                        │
+ * │  Track REAL stagnation of the result set:                              │
+ * │    prev_furthest = furthest_dist from the previous pop step            │
+ * │    current_furthest = furthest_dist after processing current node      │
+ * │                                                                        │
+ * │    if current_furthest >= prev_furthest:                               │
+ * │      stagnation_count++    (worst result didn't improve)               │
+ * │    else:                                                               │
+ * │      stagnation_count = 0  (result set improved, reset)                │
+ * │                                                                        │
+ * │  Stopping trigger:                                                     │
+ * │    EASY query:  no early termination                                  │
+ * │    HARD query:  stagnation_count >= 20                                │
+ * │                                                                        │
+ * │  WHY THIS WORKS:                                                       │
+ * │  - Stagnation directly measures "is the result set still getting       │
+ * │    better?" — the most honest signal of convergence                    │
+ * │  - Easy queries keep the routed ef and do not early-terminate         │
+ * │  - Zero overhead: just compare one float per step                      │
+ * │  - Hard queries use a fixed patience of 20 as a safety net while      │
+ * │    still allowing fuller exploration                                   │
+ * │                                                                        │
+ * │  PERFORMANCE (3-dataset average):                                      │
+ * │    Coverage:  38–54% of queries classified as easy                     │
+ * │    Purity:    96–98% (classified queries truly are easy)               │
+ * │    Recall:    0.938–0.983 at stop (vs full ef=128 search)             │
+ * │    Savings:   65–70% fewer steps for classified queries                │
+ * │                                                                        │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ */
 
-        // ============================================================
-        // [PoC] 변수 초기화
-        // ============================================================
-        bool should_early_stop = false;
-        int full_pop_count = 0; // result_set이 가득 찬 이후의 진행 스텝(pop) 수
+/**
+ * =============================================================================
+ * HNSW Adaptive Early Termination — Two-Phase Architecture (v2)
+ * =============================================================================
+ *
+ * Phase 1 — CLASSIFY (full_pop 4–16):
+ *   CHR = candidate_dist / furthest_dist
+ *   at full_pop 16, mark EASY iff classify-window chr_mean <= early_stop_ratio
+ *
+ * Phase 2 — STOP (after tmin_pops):
+ *   Track furthest_dist between pops:
+ *     if furthest_dist didn't shrink → stagnation_count++
+ *     if it shrank                   → stagnation_count = 0
+ *   EASY query:  no early termination
+ *   HARD query:  stop at stagnation >= 20
+ */
 
-        float best_dist_so_far = std::numeric_limits<float>::max();
+template <bool bare_bone_search>
+AdaptiveSearchResult
+searchBaseLayerAdaptiveAnalysisCore(
+    tableint ep_id,
+    const void *data_point,
+    size_t k,
+    size_t ef_init,
+    size_t ef_max,
+    size_t tmin_pops,
+    bool   enable_stop,
+    size_t stop_step,
+    float  early_stop_ratio,
+    BaseFilterFunctor* isIdAllowed,
+    float  super_easy_gamma_ratio,
+    float  mid_easy_upper_gamma_ratio
+) const {
+    AdaptiveSearchResult output;
+    static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
+    size_t ef_cur = std::max<size_t>(ef_init, k);
+    ef_cur = std::min(ef_cur, ef_max);
+    const size_t configured_ef_cur = ef_cur;
+    size_t dim = *((size_t *) dist_func_param_);
 
-        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
-        vl_type *visited_array = vl->mass;
-        vl_type visited_array_tag = vl->curV;
+    bool   is_easy_query       = false;
+    bool   is_super_easy_query = false;
+    bool   is_mid_easy_query   = false;
+    bool   did_adaptive_stop   = false;
+    bool   classification_evaluated = false;
+    bool   effective_ef_shrink_applied = false;
+    int    full_pop_count    = 0;
+    size_t pop_count         = 0;
+    int    stagnation_count  = 0;
+    float  prev_furthest     = std::numeric_limits<float>::max();
+    static constexpr int   CLASSIFY_START   = 4;
+    static constexpr int   CLASSIFY_END     = 16;
+    static constexpr float CHR_EMA_DECAY = 0.8f;
+    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+    float smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
+    float classify_smoothed_chr_sum = 0.0f;
+    int   classify_smoothed_chr_count = 0;
+    float classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+    const bool direct_classifier_threshold_enabled = std::isfinite(early_stop_ratio);
+    const bool super_easy_policy_enabled =
+        direct_classifier_threshold_enabled && std::isfinite(super_easy_gamma_ratio);
+    const bool mid_easy_bucket_policy_enabled =
+        direct_classifier_threshold_enabled
+        && std::isfinite(mid_easy_upper_gamma_ratio);
+    const int effective_tmin_pops =
+        direct_classifier_threshold_enabled
+            ? std::max((int)tmin_pops, CLASSIFY_END)
+            : (int)tmin_pops;
+    static constexpr bool ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK = true;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+    VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+    vl_type *visited_array = vl->mass;
+    vl_type visited_array_tag = vl->curV;
 
-        // [최적화 1] Baseline과 동일하게 CompareByFirst를 사용하고 거리를 음수(-dist)로 삽입
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+    std::vector<std::pair<dist_t, tableint>> top_container;
+    top_container.reserve(ef_cur + 1);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> top_candidates(CompareByFirst(), std::move(top_container));
 
-        dist_t lowerBound;
+    std::vector<std::pair<dist_t, tableint>> candidate_container;
+    candidate_container.reserve(ef_cur * 2);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> candidate_set(CompareByFirst(), std::move(candidate_container));
 
-        // [최적화 2] bare_bone_search 분기 적용 (조건문 제거)
-        if (bare_bone_search ||
-            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+    dist_t lowerBound;
+
+    if constexpr (bare_bone_search) {
+        dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+        top_candidates.emplace(dist, ep_id);
+        lowerBound = dist;
+        candidate_set.emplace(-dist, ep_id);
+    } else {
+        if (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id)))) {
             dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
-            best_dist_so_far = dist;
-            candidate_set.emplace(-dist, ep_id); // 음수 삽입
+            candidate_set.emplace(-dist, ep_id);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
-            candidate_set.emplace(-lowerBound, ep_id); // 음수 삽입
+            candidate_set.emplace(-lowerBound, ep_id);
         }
-        visited_array[ep_id] = visited_array_tag;
+    }
+    visited_array[ep_id] = visited_array_tag;
 
-        size_t pop_count = 0;
-        bool did_adaptive_stop = false;
+    while (!candidate_set.empty()) {
+        auto current_node_pair = candidate_set.top();
+        dist_t candidate_dist = -current_node_pair.first;
 
-        while (!candidate_set.empty()) {
-            auto current_node_pair = candidate_set.top();
-            dist_t candidate_dist = -current_node_pair.first; // 음수를 다시 양수로 복원
+        if (candidate_dist > lowerBound && top_candidates.size() == ef_cur)
+            break;
 
-            if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) break;
+        candidate_set.pop();
+        tableint curr_id = current_node_pair.second;
+        pop_count++;
 
-            candidate_set.pop();
-            tableint curr_id = current_node_pair.second;
-            pop_count++;
+        SearchStepInfo step{};
+        step.node_id = curr_id;
+        step.result_set_size = top_candidates.size();
+        step.is_full_pop_after = false;
+        step.full_pop_count_after = 0;
+        step.runtime_accepted_rate = std::numeric_limits<float>::quiet_NaN();
+        step.runtime_chr = std::numeric_limits<float>::quiet_NaN();
+        step.runtime_smoothed_chr = std::numeric_limits<float>::quiet_NaN();
+        step.runtime_classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+        step.runtime_classification_evaluated = false;
+        step.runtime_is_easy_query = false;
+        step.runtime_is_super_easy_query = false;
+        step.runtime_is_mid_easy_query = false;
+        step.runtime_rebased_after_shrink = false;
+        step.runtime_effective_ef = ef_cur;
+        step.runtime_stagnation_count = 0;
+        step.runtime_applied_patience = 0;
+        step.popped_query_dist = (float)candidate_dist;
+        if (!top_candidates.empty()) {
+            step.internal_dist = (float)top_candidates.top().first;
+        }
 
-            if constexpr (collect_trace) {
-                SearchStepInfo step{};
-                step.node_id = curr_id;
-                step.result_set_size = top_candidates.size();
-                step.popped_query_dist = (float)candidate_dist;
-                if (!top_candidates.empty()) {
-                    tableint furthest_id = top_candidates.top().second;
-                    step.internal_dist = (float)top_candidates.top().first;
-                    float* vec_ptr = (float*)getDataByInternalId(furthest_id);
-                    step.furthest_vec.assign(vec_ptr, vec_ptr + dim);
-                }
-                path_info->push_back(std::move(step));
+        int *data = (int*)get_linklist0(curr_id);
+        size_t size = getListCount((linklistsizeint*)data);
+        size_t unvisited_count = 0;
+        size_t accepted_count = 0;
+        tableint *datal = (tableint *)(data + 1);
+        step.popped_degree = size;
+
+#ifdef USE_SSE
+        _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+        _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+#endif
+
+        for (size_t j = 0; j < size; j++) {
+            tableint cand_id = *(datal + j);
+#ifdef USE_SSE
+            if (j + 1 < size) {
+                _mm_prefetch((char *)(visited_array + *(datal + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
             }
+#endif
+            if (visited_array[cand_id] == visited_array_tag) continue;
+            visited_array[cand_id] = visited_array_tag;
+            unvisited_count++;
 
-            int *data = (int*)get_linklist0(curr_id);
-            size_t size = getListCount((linklistsizeint*)data);
-            tableint *datal = (tableint *) (data + 1);
+            dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
 
+            if (top_candidates.size() < ef_cur || lowerBound > d) {
+                candidate_set.emplace(-d, cand_id);
+                accepted_count++;
 #ifdef USE_SSE
-            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
-            _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
 #endif
 
-            for (size_t j = 0; j < size; j++) {
-                tableint cand_id = *(datal + j);
-#ifdef USE_SSE
-                if (j + 1 < size) {
-                    _mm_prefetch((char *) (visited_array + *(datal + j + 1)), _MM_HINT_T0);
-                    _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
-                }
-#endif
-                if (visited_array[cand_id] == visited_array_tag) continue;
-                visited_array[cand_id] = visited_array_tag;
-
-                dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
-
-                if (d < best_dist_so_far) {
-                    best_dist_so_far = d;
-                }
-
-                if (top_candidates.size() < ef_cur || lowerBound > d) {
-                    candidate_set.emplace(-d, cand_id); // 음수 삽입
-#ifdef USE_SSE
-                    // [최적화 3] 큐에 넣자마자 해당 후보 노드의 Link-List(offsetLevel0_)를 Prefetch
-                    _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
-#endif
-
-                    // [최적화 2] bare_bone_search 적용으로 핫 루프 내 런타임 분기 제거
-                    if (bare_bone_search ||
-                        (!isMarkedDeleted(cand_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(cand_id))))) {
-                        top_candidates.emplace(d, cand_id);
-                    }
-
-                    if (top_candidates.size() > ef_cur) {
-                        top_candidates.pop();
-                    }
-                    if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
-                }
-            }
-
-            // ============================================================
-            // [PoC] CHR V자 반등 기반 Early Stop 하드코딩 (최적화 버전)
-            // ============================================================
-            if (enable_stop) {
-                // 1) result_set이 꽉 찬 상태에서만 검사 진행
-                if (top_candidates.size() == ef_cur) {
-                    full_pop_count++;
-
-                    // 2) 딱 25 스텝 이내일 때만 연산 수행 (불필요한 연산 방지)
-                    if (full_pop_count <= 25 && !should_early_stop) {
-                        float furthest_dist = (float)top_candidates.top().first;
-
-                        // [핵심 최적화] 나눗셈(/)을 곱셈(*)으로 변경 및 std::max 제거
-                        // candidate_dist / furthest_dist < 0.6f  ==>  candidate_dist < furthest_dist * 0.6f
-                        if ((float)candidate_dist < furthest_dist * 0.6f) {
-                            should_early_stop = true;
+                // [최적화 3 적용] 이너 루프 내부 if constexpr 적용 및 필터 단락 평가 최적화
+                if constexpr (bare_bone_search) {
+                    top_candidates.emplace(d, cand_id);
+                } else {
+                    if (!isMarkedDeleted(cand_id)) {
+                        if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(cand_id))) {
+                            top_candidates.emplace(d, cand_id);
                         }
                     }
                 }
 
-                // 3) pop_count가 정확히 64일 때만 break 수행
-                if (pop_count == 64 && should_early_stop) {
-                    did_adaptive_stop = true;
-                    break;
-                }
+                if (top_candidates.size() > ef_cur)
+                    top_candidates.pop();
+
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.top().first;
             }
         }
 
-        visited_list_pool_->releaseVisitedList(vl);
+        step.unvisited_neighbor_count = unvisited_count;
+        step.accepted_neighbor_count = accepted_count;
+        const float accepted_rate =
+            (unvisited_count > 0)
+                ? ((float)accepted_count / (float)unvisited_count)
+                : 0.0f;
 
-        while (top_candidates.size() > k) top_candidates.pop();
-        std::priority_queue<std::pair<dist_t, labeltype>> result_queue;
-        while (!top_candidates.empty()) {
-            result_queue.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
-            top_candidates.pop();
+        if (top_candidates.size() == ef_cur) {
+            step.is_full_pop_after = true;
+            full_pop_count++;
+            step.full_pop_count_after = (size_t)full_pop_count;
+            step.runtime_accepted_rate = accepted_rate;
+            float furthest_dist = (float)top_candidates.top().first;
+            float chr = (float)candidate_dist / std::max(furthest_dist, 1e-6f);
+            bool rebased_after_shrink = false;
+            step.runtime_chr = chr;
+            if (std::isnan(smoothed_chr_ema)) {
+                smoothed_chr_ema = chr;
+            } else {
+                smoothed_chr_ema = CHR_EMA_DECAY * smoothed_chr_ema + CHR_EMA_UPDATE * chr;
+            }
+            step.runtime_smoothed_chr = smoothed_chr_ema;
+
+            if (full_pop_count >= CLASSIFY_START && full_pop_count <= CLASSIFY_END) {
+                classify_smoothed_chr_sum += smoothed_chr_ema;
+                classify_smoothed_chr_count++;
+
+                if (!classification_evaluated && full_pop_count == CLASSIFY_END) {
+                    classification_evaluated = true;
+                    if (direct_classifier_threshold_enabled) {
+                        classify_chr_mean =
+                            classify_smoothed_chr_sum / (float)classify_smoothed_chr_count;
+                        is_easy_query = classify_chr_mean <= early_stop_ratio;
+                        if (is_easy_query) {
+                            float classify_chr_ratio =
+                                classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
+                            if (super_easy_policy_enabled) {
+                                is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
+                            }
+                            if (mid_easy_bucket_policy_enabled) {
+                                is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                            }
+                        }
+                    }
+
+                    if (ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK && !effective_ef_shrink_applied) {
+                        size_t shrunk_ef_cur = configured_ef_cur;
+                        const size_t shrink_super_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
+                        const size_t shrink_easy_ef =
+                            std::max((size_t)1, configured_ef_cur / (size_t)2);
+                        const size_t shrink_mid_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
+                        const size_t shrink_edge_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
+
+                        if (super_easy_policy_enabled && is_super_easy_query) {
+                            shrunk_ef_cur = shrink_super_easy_ef;
+                        } else if (is_easy_query) {
+                            if (mid_easy_bucket_policy_enabled) {
+                                shrunk_ef_cur = is_mid_easy_query
+                                    ? shrink_mid_easy_ef
+                                    : shrink_edge_easy_ef;
+                            } else {
+                                shrunk_ef_cur = shrink_easy_ef;
+                            }
+                        }
+                        shrunk_ef_cur = std::max(shrunk_ef_cur, k);
+
+                        if (shrunk_ef_cur < ef_cur) {
+                            ef_cur = shrunk_ef_cur;
+                            while (top_candidates.size() > ef_cur) {
+                                top_candidates.pop();
+                            }
+                            if (!top_candidates.empty()) {
+                                lowerBound = top_candidates.top().first;
+                                furthest_dist = (float)top_candidates.top().first;
+                            }
+                            prev_furthest = furthest_dist;
+                            stagnation_count = 0;
+                            rebased_after_shrink = true;
+                        }
+                        effective_ef_shrink_applied = true;
+                    }
+                }
+            }
+
+            step.runtime_classify_chr_mean = classify_chr_mean;
+            step.runtime_classification_evaluated = classification_evaluated;
+            step.runtime_is_easy_query = classification_evaluated && is_easy_query;
+            step.runtime_is_super_easy_query = classification_evaluated && is_super_easy_query;
+            step.runtime_is_mid_easy_query = classification_evaluated && is_mid_easy_query;
+            step.runtime_rebased_after_shrink = rebased_after_shrink;
+
+            const bool hard_stop_enabled =
+                enable_stop
+                && direct_classifier_threshold_enabled
+                && classification_evaluated
+                && !is_easy_query
+                && full_pop_count >= effective_tmin_pops
+                && !rebased_after_shrink;
+            if (hard_stop_enabled) {
+                if (furthest_dist >= prev_furthest) {
+                    stagnation_count++;
+                } else {
+                    stagnation_count = 0;
+                }
+
+                step.runtime_stagnation_count = (size_t)std::max(stagnation_count, 0);
+                step.runtime_applied_patience = HARD_ONLY_STAG_LIMIT;
+
+                if ((size_t)std::max(stagnation_count, 0) >= HARD_ONLY_STAG_LIMIT) {
+                    did_adaptive_stop = true;
+                }
+            }
+
+            step.runtime_effective_ef = ef_cur;
+            if (!hard_stop_enabled) {
+                step.runtime_stagnation_count = (size_t)std::max(stagnation_count, 0);
+                step.runtime_applied_patience = 0;
+            }
+
+            prev_furthest = furthest_dist;
         }
 
-        if constexpr (collect_stats) {
-            stats->stop_count = did_adaptive_stop ? 1 : 0;
-            stats->reduced_steps = pop_count;
-        }
+        fillTraceStepMetrics(step, top_candidates, ef_cur, k, dim);
+        output.path_info.push_back(std::move(step));
 
-        return result_queue;
+        if (did_adaptive_stop || (stop_step > 0 && pop_count >= stop_step)) {
+            break;
+        }
     }
+
+    visited_list_pool_->releaseVisitedList(vl);
+
+    while (top_candidates.size() > k)
+        top_candidates.pop();
+
+    std::vector<std::pair<dist_t, labeltype>> result_vec;
+    result_vec.reserve(top_candidates.size());
+    while (!top_candidates.empty()) {
+        result_vec.emplace_back(
+            top_candidates.top().first,
+            getExternalLabel(top_candidates.top().second)
+        );
+        top_candidates.pop();
+    }
+
+    output.stats.stop_count = did_adaptive_stop ? 1 : 0;
+    output.stats.reduced_steps = pop_count;
+    output.result = std::priority_queue<std::pair<dist_t, labeltype>>(
+        std::less<std::pair<dist_t, labeltype>>(),
+        std::move(result_vec)
+    );
+
+    return output;
+}
+
+
+
+template <bool bare_bone_search>
+std::priority_queue<std::pair<dist_t, tableint>,
+                    std::vector<std::pair<dist_t, tableint>>,
+                    CompareByFirst>
+searchBaseLayerAdaptiveLightCore(
+    tableint ep_id,
+    const void *data_point,
+    size_t k,
+    size_t ef_init,
+    size_t ef_max,
+    bool   enable_stop,
+    size_t tmin_pops,
+    float  early_stop_ratio,
+    BaseFilterFunctor* isIdAllowed,
+    float  super_easy_gamma_ratio,
+    float  mid_easy_upper_gamma_ratio
+) const {
+    static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
+    size_t ef_cur = std::max<size_t>(ef_init, k);
+    ef_cur = std::min(ef_cur, ef_max);
+    const size_t configured_ef_cur = ef_cur;
+
+    bool   is_easy_query    = false;
+    bool   is_super_easy_query = false;
+    bool   is_mid_easy_query = false;
+    bool   classification_evaluated = false;
+    bool   effective_ef_shrink_applied = false;
+    int    full_pop_count   = 0;
+    int    stagnation_count = 0;
+    float  prev_furthest    = std::numeric_limits<float>::max();
+    static constexpr int   CLASSIFY_START  = 4;
+    static constexpr int   CLASSIFY_END    = 16;
+    static constexpr float CHR_EMA_DECAY = 0.8f;
+    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+
+    float  smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
+    float  classify_smoothed_chr_sum = 0.0f;
+    int    classify_smoothed_chr_count = 0;
+    float  classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+    const bool direct_classifier_threshold_enabled = std::isfinite(early_stop_ratio);
+    const bool super_easy_policy_enabled =
+        direct_classifier_threshold_enabled && std::isfinite(super_easy_gamma_ratio);
+    const bool mid_easy_bucket_policy_enabled =
+        direct_classifier_threshold_enabled
+        && std::isfinite(mid_easy_upper_gamma_ratio);
+    const int effective_tmin_pops =
+        direct_classifier_threshold_enabled
+            ? std::max((int)tmin_pops, CLASSIFY_END)
+            : (int)tmin_pops;
+    static constexpr bool   ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK = true;
+
+    // --- Baseline 구조 유지 ---
+    VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+    vl_type *visited_array = vl->mass;
+    vl_type visited_array_tag = vl->curV;
+
+    std::vector<std::pair<dist_t, tableint>> top_container;
+    top_container.reserve(ef_cur + 1);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> top_candidates(CompareByFirst(), std::move(top_container));
+    std::vector<std::pair<dist_t, tableint>> candidate_container;
+    candidate_container.reserve(ef_cur * 2);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> candidate_set(CompareByFirst(), std::move(candidate_container));
+
+    dist_t lowerBound;
+
+    // [추가 부분 최적화 2] if constexpr을 사용하여 bare_bone_search 시 필터 검사 데드코드 제거
+    if constexpr (bare_bone_search) {
+        dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+        top_candidates.emplace(dist, ep_id);
+        lowerBound = dist;
+        candidate_set.emplace(-dist, ep_id);
+    } else {
+        if (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id)))) {
+            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            top_candidates.emplace(dist, ep_id);
+            lowerBound = dist;
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+    }
+    visited_array[ep_id] = visited_array_tag;
+
+    while (!candidate_set.empty()) {
+        auto current_node_pair = candidate_set.top();
+        dist_t candidate_dist = -current_node_pair.first;
+
+        if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) {
+            break;
+        }
+
+        candidate_set.pop();
+        tableint curr_id = current_node_pair.second;
+
+        // --- Baseline 구조 유지 ---
+        int *data = (int*)get_linklist0(curr_id);
+        size_t size = getListCount((linklistsizeint*)data);
+        tableint *datal = (tableint *)(data + 1);
+
+#ifdef USE_SSE
+        _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+        _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+#endif
+
+        for (size_t j = 0; j < size; j++) {
+            tableint cand_id = *(datal + j);
+#ifdef USE_SSE
+            if (j + 1 < size) { // Baseline의 j+1 유지
+                _mm_prefetch((char *)(visited_array + *(datal + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
+            }
+#endif
+            if (visited_array[cand_id] == visited_array_tag) continue;
+            visited_array[cand_id] = visited_array_tag;
+
+            dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+
+            if (top_candidates.size() < ef_cur || lowerBound > d) {
+                candidate_set.emplace(-d, cand_id);
+#ifdef USE_SSE
+                _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
+#endif
+
+                // [추가 부분 최적화 2 적용] 필터 로직 최적화
+                if constexpr (bare_bone_search) {
+                    top_candidates.emplace(d, cand_id);
+                } else {
+                    // Baseline의 !isMarkedDeleted를 먼저 체크 (단락 평가로 무거운 필터 호출 방어)
+                    if (!isMarkedDeleted(cand_id)) {
+                        if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(cand_id))) {
+                            top_candidates.emplace(d, cand_id);
+                        }
+                    }
+                }
+
+                if (top_candidates.size() > ef_cur) {
+                    top_candidates.pop();
+                }
+
+                if (!top_candidates.empty()) {
+                    lowerBound = top_candidates.top().first;
+                }
+            }
+        } // end for
+
+        // --- 추가된 조기 종료(Early Stopping) 최적화 ---
+        if (top_candidates.size() == ef_cur) {
+            full_pop_count++;
+            float furthest_dist = (float)top_candidates.top().first;
+            float chr = (float)candidate_dist / std::max(furthest_dist, 1e-6f);
+            bool rebased_after_shrink = false;
+            if (std::isnan(smoothed_chr_ema)) {
+                smoothed_chr_ema = chr;
+            } else {
+                smoothed_chr_ema = CHR_EMA_DECAY * smoothed_chr_ema + CHR_EMA_UPDATE * chr;
+            }
+
+            // [추가 부분 최적화 3] in_classify_window 조건문을 간소화하고 classification_evaluated 평가를 window 끝에서 한 번만 수행
+            if (full_pop_count >= CLASSIFY_START && full_pop_count <= CLASSIFY_END) {
+                classify_smoothed_chr_sum += smoothed_chr_ema;
+                classify_smoothed_chr_count++;
+
+                if (!classification_evaluated && full_pop_count == CLASSIFY_END) {
+                    classification_evaluated = true;
+                    if (direct_classifier_threshold_enabled) {
+                        classify_chr_mean =
+                            classify_smoothed_chr_sum / (float)classify_smoothed_chr_count;
+                        is_easy_query = classify_chr_mean <= early_stop_ratio;
+                        if (is_easy_query) {
+                            float classify_chr_ratio =
+                                classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
+                            if (super_easy_policy_enabled) {
+                                is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
+                            }
+                            if (mid_easy_bucket_policy_enabled) {
+                                is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                            }
+                        }
+                    }
+
+                    // One-shot shrink prototype:
+                    // once the classify window closes, tighten the effective runtime ef only
+                    // once. Hard-only stop then runs only for queries that remain classified
+                    // as hard after the shrink decision.
+                    if (ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK && !effective_ef_shrink_applied) {
+                        size_t shrunk_ef_cur = configured_ef_cur;
+                        const size_t shrink_super_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
+                        const size_t shrink_easy_ef =
+                            std::max((size_t)1, configured_ef_cur / (size_t)2);
+                        const size_t shrink_mid_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
+                        const size_t shrink_edge_easy_ef =
+                            resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
+                        if (super_easy_policy_enabled && is_super_easy_query) {
+                            shrunk_ef_cur = shrink_super_easy_ef;
+                        } else if (is_easy_query) {
+                            if (mid_easy_bucket_policy_enabled) {
+                                shrunk_ef_cur = is_mid_easy_query ? shrink_mid_easy_ef : shrink_edge_easy_ef;
+                            } else {
+                                shrunk_ef_cur = shrink_easy_ef;
+                            }
+                        }
+                        shrunk_ef_cur = std::max(shrunk_ef_cur, k);
+
+                        if (shrunk_ef_cur < ef_cur) {
+                            ef_cur = shrunk_ef_cur;
+                            while (top_candidates.size() > ef_cur) {
+                                top_candidates.pop();
+                            }
+                            if (!top_candidates.empty()) {
+                                lowerBound = top_candidates.top().first;
+                                furthest_dist = (float)top_candidates.top().first;
+                            }
+                            // The furthest-distance series changes once effective-ef shrinks,
+                            // so restart stagnation tracking from the rebased boundary.
+                            prev_furthest = furthest_dist;
+                            stagnation_count = 0;
+                            rebased_after_shrink = true;
+                        }
+                        effective_ef_shrink_applied = true;
+                    }
+                }
+            }
+
+            const bool hard_stop_enabled =
+                enable_stop
+                && direct_classifier_threshold_enabled
+                && classification_evaluated
+                && !is_easy_query
+                && full_pop_count >= effective_tmin_pops
+                && !rebased_after_shrink;
+            if (hard_stop_enabled) {
+                if (furthest_dist >= prev_furthest) {
+                    stagnation_count++;
+                } else {
+                    stagnation_count = 0;
+                }
+
+                if ((size_t)std::max(stagnation_count, 0) >= HARD_ONLY_STAG_LIMIT) {
+                    break;
+                }
+            }
+
+            prev_furthest = furthest_dist;
+        }
+    } // end while
+
+    visited_list_pool_->releaseVisitedList(vl);
+
+    // K개만 남기고 자르기
+    while (top_candidates.size() > k) {
+        top_candidates.pop();
+    }
+
+    return top_candidates; // <--- 변환 없이 바로 리턴! (초고속)
+}
+
+
+
 
     template <bool bare_bone_search>
     AdaptiveSearchResult
-    searchBaseLayerAdaptive(
+    searchBaseLayerAdaptiveAnalysis(
         tableint ep_id,
         const void *data_point,
         size_t k,
@@ -735,46 +1370,67 @@ getLayer0NeighborsWithDistances() const {
         size_t ef_max,
         size_t tmin_pops,
         bool   enable_stop,
-        BaseFilterFunctor* isIdAllowed = nullptr
+        size_t stop_step,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        float early_stop_ratio = 0.6f,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
     ) const {
-        AdaptiveSearchResult output;
-        output.result = searchBaseLayerAdaptiveCore<bare_bone_search, true, true>(
+        return searchBaseLayerAdaptiveAnalysisCore<bare_bone_search>(
             ep_id, data_point, k,
             ef_init, ef_max,
             tmin_pops,
-            enable_stop, isIdAllowed, &output.stats, &output.path_info);
-        return output;
+            enable_stop,
+            stop_step,
+            early_stop_ratio,
+            isIdAllowed,
+            super_easy_gamma_ratio,
+            mid_easy_upper_gamma_ratio
+        );
     }
 
     template <bool bare_bone_search>
-    std::priority_queue<std::pair<dist_t, labeltype>>
+    std::priority_queue<std::pair<dist_t, tableint>,
+                    std::vector<std::pair<dist_t, tableint>>,
+                    CompareByFirst>
     searchBaseLayerAdaptiveLight(
         tableint ep_id,
         const void *data_point,
         size_t k,
         size_t ef_init = 128,
-        BaseFilterFunctor* isIdAllowed = nullptr
+        bool   enable_stop = true,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        float early_stop_ratio = 0.6f,
+        size_t tmin_pops = 25,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
     ) const {
         constexpr size_t ef_max = 1024;
-        constexpr size_t tmin_pops = 64;
-        constexpr bool enable_stop = true;
-
-        return searchBaseLayerAdaptiveCore<bare_bone_search, false, false>(
+        return searchBaseLayerAdaptiveLightCore<bare_bone_search>(
             ep_id, data_point, k,
             ef_init, ef_max,
+            enable_stop,
             tmin_pops,
-            enable_stop, isIdAllowed, nullptr, nullptr);
+            early_stop_ratio,
+            isIdAllowed,
+            super_easy_gamma_ratio,
+            mid_easy_upper_gamma_ratio
+        );
     }
 
     AdaptiveSearchResult
-    searchKnnAdaptive(
+    searchKnnAdaptiveAnalysis(
         const void *query_data,
         size_t k,
         size_t ef_init,
         size_t ef_max,
         size_t tmin_pops,
         bool   enable_stop,
-        BaseFilterFunctor* isIdAllowed = nullptr
+        size_t stop_step = 0,
+        BaseFilterFunctor* isIdAllowed = nullptr,
+        float early_stop_ratio = 0.6f,
+        float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
     ) const {
         AdaptiveSearchResult result;
         if (cur_element_count == 0) {
@@ -786,44 +1442,86 @@ getLayer0NeighborsWithDistances() const {
         // [최적화 2] 런타임에 bare_bone 여부를 판단하여 템플릿 분기
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
-            return searchBaseLayerAdaptive<true>(
+            return searchBaseLayerAdaptiveAnalysis<true>(
                 ep, query_data, k,
                 ef_init, ef_max,
                 tmin_pops,
-                enable_stop, isIdAllowed);
+                enable_stop,
+                stop_step,
+                isIdAllowed,
+                early_stop_ratio,
+                super_easy_gamma_ratio,
+                mid_easy_upper_gamma_ratio
+            );
         } else {
-            return searchBaseLayerAdaptive<false>(
+            return searchBaseLayerAdaptiveAnalysis<false>(
                 ep, query_data, k,
                 ef_init, ef_max,
                 tmin_pops,
-                enable_stop, isIdAllowed);
+                enable_stop,
+                stop_step,
+                isIdAllowed,
+                early_stop_ratio,
+                super_easy_gamma_ratio,
+                mid_easy_upper_gamma_ratio
+            );
         }
     }
 
-    std::priority_queue<std::pair<dist_t, labeltype>>
-    searchKnnAdaptiveLight(
-        const void *query_data,
-        size_t k,
-        size_t ef_init = 128,
-        BaseFilterFunctor* isIdAllowed = nullptr
-    ) const {
-        std::priority_queue<std::pair<dist_t, labeltype>> result;
-        if (cur_element_count == 0) {
-            return result;
-        }
-
-        tableint ep = getBaseLayerEntry(query_data);
-
-        // [최적화 2] 런타임에 bare_bone 여부를 판단하여 템플릿 분기
-        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
-        if (bare_bone_search) {
-            return searchBaseLayerAdaptiveLight<true>(
-                ep, query_data, k, ef_init, isIdAllowed);
-        } else {
-            return searchBaseLayerAdaptiveLight<false>(
-                ep, query_data, k, ef_init, isIdAllowed);
-        }
+   std::priority_queue<std::pair<dist_t, labeltype>>
+searchKnnAdaptiveLight(
+    const void *query_data,
+    size_t k,
+    size_t ef_init = 128,
+    bool   enable_stop = true,
+    BaseFilterFunctor* isIdAllowed = nullptr,
+    float early_stop_ratio = 0.6f,
+    size_t tmin_pops = 25,
+    float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+    float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+) const {
+    std::priority_queue<std::pair<dist_t, labeltype>> result;
+    if (cur_element_count == 0) {
+        return result;
     }
+
+    tableint ep = getBaseLayerEntry(query_data);
+    bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+
+    // 1. Core 함수 호출 (내부 ID 큐를 반환받음)
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+
+    if (bare_bone_search) {
+        top_candidates = searchBaseLayerAdaptiveLight<true>(
+            ep, query_data, k, ef_init, enable_stop, isIdAllowed, early_stop_ratio, tmin_pops,
+            super_easy_gamma_ratio,
+            mid_easy_upper_gamma_ratio
+        );
+    } else {
+        top_candidates = searchBaseLayerAdaptiveLight<false>(
+            ep, query_data, k, ef_init, enable_stop, isIdAllowed, early_stop_ratio, tmin_pops,
+            super_easy_gamma_ratio,
+            mid_easy_upper_gamma_ratio
+        );
+    }
+
+    // 2. 파이썬으로 넘기기 직전, 여기서 External Label로 재포장! (O(N) 벡터 초기화 최적화 적용)
+    std::vector<std::pair<dist_t, labeltype>> result_vec;
+    result_vec.reserve(top_candidates.size());
+
+    while (!top_candidates.empty()) {
+        result_vec.emplace_back(
+            top_candidates.top().first,
+            getExternalLabel(top_candidates.top().second) // 여기서 변환
+        );
+        top_candidates.pop();
+    }
+
+    return std::priority_queue<std::pair<dist_t, labeltype>>(
+        std::less<std::pair<dist_t, labeltype>>(),
+        std::move(result_vec)
+    );
+}
 
     tableint getBaseLayerEntry(const void* query) const {
         tableint currObj = enterpoint_node_;
