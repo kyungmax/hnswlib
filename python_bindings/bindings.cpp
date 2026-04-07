@@ -7,7 +7,9 @@
 #endif
 
 #include <iostream>
+#include <algorithm>
 #include <limits>
+#include <random>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -988,6 +990,63 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         }
     }
 
+    py::tuple calcLidsInternalSampled(
+        size_t k_lid,
+        float sample_fraction = 0.001f,
+        size_t min_sample_size = 1000,
+        size_t random_seed = 42,
+        int num_threads = -1
+    ) {
+        if (!appr_alg) throw std::runtime_error("Index not initialized");
+        if (k_lid < 2) throw std::invalid_argument("k_lid must be at least 2.");
+        if (!(sample_fraction > 0.0f && sample_fraction <= 1.0f)) {
+            throw std::invalid_argument("sample_fraction must be in (0, 1].");
+        }
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        std::vector<hnswlib::tableint> active_ids;
+        active_ids.reserve(appr_alg->cur_element_count);
+        for (size_t i = 0; i < appr_alg->cur_element_count; ++i) {
+            if (!appr_alg->isMarkedDeleted((hnswlib::tableint)i)) {
+                active_ids.push_back((hnswlib::tableint)i);
+            }
+        }
+
+        if (active_ids.empty()) {
+            return py::make_tuple(py::array_t<hnswlib::labeltype>(0), py::array_t<float>(0));
+        }
+
+        size_t sample_size = std::max(
+            static_cast<size_t>(std::ceil(static_cast<double>(active_ids.size()) * static_cast<double>(sample_fraction))),
+            min_sample_size
+        );
+        sample_size = std::min(sample_size, active_ids.size());
+
+        std::mt19937 rng(static_cast<uint32_t>(random_seed));
+        std::shuffle(active_ids.begin(), active_ids.end(), rng);
+        active_ids.resize(sample_size);
+        std::sort(active_ids.begin(), active_ids.end());
+
+        std::vector<float> sampled_lids(sample_size, 0.0f);
+        {
+            py::gil_scoped_release l;
+            ParallelFor(0, sample_size, num_threads, [&](size_t idx, size_t threadId) {
+                (void)threadId;
+                sampled_lids[idx] = appr_alg->calcNodeLidValueInternal(active_ids[idx], k_lid);
+            });
+        }
+
+        py::array_t<hnswlib::labeltype> ids_array({ static_cast<py::ssize_t>(sample_size) });
+        py::array_t<float> lids_array({ static_cast<py::ssize_t>(sample_size) });
+        auto ids_view = ids_array.mutable_unchecked<1>();
+        auto lids_view = lids_array.mutable_unchecked<1>();
+        for (size_t idx = 0; idx < sample_size; ++idx) {
+            ids_view(static_cast<py::ssize_t>(idx)) = static_cast<hnswlib::labeltype>(active_ids[idx]);
+            lids_view(static_cast<py::ssize_t>(idx)) = sampled_lids[idx];
+        }
+        return py::make_tuple(ids_array, lids_array);
+    }
+
     py::array_t<float> getLids() {
     if (!appr_alg || appr_alg->node_lid_.empty()) {
         return py::array_t<float>(0);
@@ -1676,6 +1735,14 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k_lid"),
             py::arg("num_threads") = -1,
             "Calculate LID for all nodes internally using k-NN search"
+        )
+        .def("calc_lids_internal_sampled", &Index<float>::calcLidsInternalSampled,
+            py::arg("k_lid"),
+            py::arg("sample_fraction") = 0.001f,
+            py::arg("min_sample_size") = 1000,
+            py::arg("random_seed") = 42,
+            py::arg("num_threads") = -1,
+            "Calculate internal-node LIDs only for a random sampled subset and return (query_ids, lids)."
         )
         .def("add_items",
             &Index<float>::addItems,

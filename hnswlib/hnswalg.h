@@ -332,8 +332,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // Returns: map[node_id] -> vector of (neighbor_id, distance)
 
     // hnswalg.h 내 HierarchicalNSW 클래스 public 영역에 추가
-    void calcNodeLidInternal(tableint internal_id, size_t k_lid) {
-        if (k_lid < 2) return;
+    float calcNodeLidValueInternal(tableint internal_id, size_t k_lid) {
+        if (k_lid < 2) return 0.0f;
 
         // 1. 해당 노드의 벡터 데이터 가져오기
         void* query_data = getDataByInternalId(internal_id);
@@ -354,7 +354,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // 4. MLE LID 계산
         // Formula: LID = - [ (1/k) * sum_{i=1}^{k-1} ln(d_i / d_k) ]^-1
         float sum_log = 0.0f;
-        int count = 0;
         float d_max = 0;
 
         // d_0은 자기 자신(거리 0)일 것이므로 i=1부터 시작하여 실제 이웃들 계산
@@ -368,8 +367,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         if (actual_k < 2 || d_max <= 1e-9) {
-            node_lid_[internal_id] = 0.0f;
-            return;
+            return 0.0f;
         }
 
         float valid_k = 0;
@@ -381,10 +379,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         if (sum_log != 0) {
-            node_lid_[internal_id] = - (valid_k / sum_log);
-        } else {
-            node_lid_[internal_id] = 0.0f;
+            return - (valid_k / sum_log);
         }
+        return 0.0f;
+    }
+
+    void calcNodeLidInternal(tableint internal_id, size_t k_lid) {
+        node_lid_[internal_id] = calcNodeLidValueInternal(internal_id, k_lid);
     }
 
     std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>

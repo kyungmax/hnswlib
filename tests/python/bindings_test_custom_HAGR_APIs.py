@@ -147,6 +147,27 @@ class AdaptiveDebugTestCase(unittest.TestCase):
         self.assertEqual(int(reduced_steps[0]), 64)
         self.assertEqual(int(stop_count), 0)
 
+    def test_sampled_internal_lids_api_preserves_full_lids(self):
+        full_lids_before = np.array(self.p.get_lids(), copy=True)
+
+        sampled_ids, sampled_lids = self.p.calc_lids_internal_sampled(
+            k_lid=15,
+            sample_fraction=0.01,
+            min_sample_size=64,
+            random_seed=7,
+            num_threads=1,
+        )
+
+        self.assertEqual(sampled_ids.ndim, 1)
+        self.assertEqual(sampled_lids.ndim, 1)
+        self.assertEqual(sampled_ids.shape[0], sampled_lids.shape[0])
+        self.assertEqual(sampled_ids.shape[0], max(int(np.ceil(self.num_elements * 0.01)), 64))
+        self.assertTrue(np.all(sampled_ids[:-1] <= sampled_ids[1:]))
+        self.assertTrue(np.all(np.isfinite(sampled_lids)))
+
+        full_lids_after = np.array(self.p.get_lids(), copy=True)
+        np.testing.assert_allclose(full_lids_after, full_lids_before)
+
     def test_direct_mean_threshold_changes_analysis_behavior(self):
         base_cfg = dict(
             ef_init=128,
