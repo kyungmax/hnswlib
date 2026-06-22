@@ -213,6 +213,41 @@ class Index {
 
     };
 
+    std::vector<hnswlib::tableint> resolveHiddenLabels(const py::object& hide_labels, size_t rows) const {
+        std::vector<hnswlib::tableint> hidden(
+            rows,
+            hnswlib::HierarchicalNSW<dist_t>::HIDDEN_NODE_NONE
+        );
+        if (hide_labels.is_none()) {
+            return hidden;
+        }
+        if (!appr_alg) {
+            throw std::runtime_error("Index is not initialized.");
+        }
+
+        py::array_t<hnswlib::labeltype, py::array::c_style | py::array::forcecast> labels_arr(hide_labels);
+        auto labels_req = labels_arr.request();
+        if (labels_req.ndim == 0) {
+            if (rows != 1) {
+                throw std::runtime_error("Scalar hide_labels is only valid for a single query.");
+            }
+        } else if (!(labels_req.ndim == 1 && (size_t)labels_req.shape[0] == rows)) {
+            throw std::runtime_error("hide_labels must be None, a scalar for one query, or a 1D array matching query rows.");
+        }
+
+        const hnswlib::labeltype* labels_ptr = labels_arr.data();
+        std::unique_lock<std::mutex> lock(appr_alg->label_lookup_lock);
+        for (size_t row = 0; row < rows; ++row) {
+            hnswlib::labeltype label = labels_req.ndim == 0 ? labels_ptr[0] : labels_ptr[row];
+            auto it = appr_alg->label_lookup_.find(label);
+            if (it == appr_alg->label_lookup_.end()) {
+                throw std::runtime_error("hide_labels contains a label that is not present in the index.");
+            }
+            hidden[row] = it->second;
+        }
+        return hidden;
+    }
+
     py::dict searchStepInfoToDict(const hnswlib::SearchStepInfo& s) const {
         py::dict d;
         float node_internal_lid = std::numeric_limits<float>::quiet_NaN();
@@ -589,7 +624,7 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         size_t ef,
         int num_threads = -1
     ) {
-        SearchBatchResult res = _searchLayer0PathBatchInternal(input, ef, num_threads, 10);
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, 10, ef, num_threads);
         return res.paths;
     }
 
@@ -605,17 +640,40 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         return py::make_tuple(res.paths, res.total_dist_count, res.closest_dists);
     }
 
+    py::object searchLayer0PathHideNodeBatch(
+        py::object input,
+        size_t ef,
+        py::object hide_labels,
+        int num_threads = -1
+    ) {
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, 10, ef, num_threads, hide_labels);
+        return res.paths;
+    }
+
+    py::tuple searchLayer0PathHideNodeBatchWithMetrics(
+        py::object input,
+        size_t k,
+        size_t ef,
+        py::object hide_labels,
+        int num_threads = -1
+    ) {
+        SearchBatchResult res = _searchLayer0PathBatchInternal(input, k, ef, num_threads, hide_labels);
+        return py::make_tuple(res.paths, res.total_dist_count, res.closest_dists);
+    }
+
 
     SearchBatchResult _searchLayer0PathBatchInternal(
         py::object input,
         size_t k,
         size_t ef,
-        int num_threads
+        int num_threads,
+        py::object hide_labels = py::none()
     ) {
         py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
         auto buffer = items.request();
         size_t rows, features;
         get_input_array_shapes(buffer, &rows, &features);
+        std::vector<hnswlib::tableint> hidden_internal_ids = resolveHiddenLabels(hide_labels, rows);
 
         if (num_threads <= 0) num_threads = num_threads_default;
 
@@ -639,7 +697,8 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                 }
 
                 // C++ 구조체로 결과 수집
-                auto [steps, count, closest_dist] = appr_alg->searchKnnWithLayer0Trace(query_ptr, ef, k);
+                auto [steps, count, closest_dist] =
+                    appr_alg->searchKnnWithLayer0Trace(query_ptr, ef, k, hidden_internal_ids[row]);
                 raw_results[row] = std::move(steps);
                 dist_counts[row] = count;
                 closest_dists[row] = closest_dist;
@@ -1451,6 +1510,91 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                 free_when_done_d));
     }
 
+    py::object knnQueryHideNode_return_numpy(
+        py::object input,
+        size_t k,
+        py::object hide_labels,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+        std::vector<hnswlib::tableint> hidden_internal_ids = resolveHiddenLabels(hide_labels, rows);
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+
+            if (rows <= num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnWithHiddenNode(
+                        (void*)items.data(row), k, p_idFilter, hidden_internal_ids[row]);
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnWithHiddenNode(
+                        (void*)(norm_array.data() + start_idx), k, p_idFilter, hidden_internal_ids[row]);
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            }
+        }
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) {
+            delete[] f;
+            });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { k * sizeof(hnswlib::labeltype),
+                  sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },
+                { k * sizeof(dist_t), sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d));
+    }
+
 
     void markDeleted(size_t label) {
         appr_alg->markDelete(label);
@@ -1683,6 +1827,13 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
+        .def("knn_query_hide_node",
+            &Index<float>::knnQueryHideNode_return_numpy,
+            py::arg("data"),
+            py::arg("k"),
+            py::arg("hide_labels"),
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none())
         .def("knn_query_adaptive_analysis",
             &Index<float>::knnQueryAdaptiveAnalysis,
             py::arg("data"),
@@ -1829,11 +1980,26 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("ef"),
             py::arg("num_threads") = -1
         )
+        .def("search_layer0_path_hide_node_batch",
+            &Index<float>::searchLayer0PathHideNodeBatch,
+            py::arg("data"),
+            py::arg("ef"),
+            py::arg("hide_labels"),
+            py::arg("num_threads") = -1
+        )
         .def("search_layer0_path_with_dist_metrics_batch",
             &Index<float>::searchLayer0PathBatchWithMetrics,
             py::arg("data"),
             py::arg("k"),
             py::arg("ef"),
+            py::arg("num_threads") = -1
+        )
+        .def("search_layer0_path_with_dist_metrics_hide_node_batch",
+            &Index<float>::searchLayer0PathHideNodeBatchWithMetrics,
+            py::arg("data"),
+            py::arg("k"),
+            py::arg("ef"),
+            py::arg("hide_labels"),
             py::arg("num_threads") = -1
         )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")

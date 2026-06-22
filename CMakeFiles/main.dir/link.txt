@@ -1,0 +1,1 @@
+/usr/bin/c++ -Ofast -lrt -std=c++11 -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0 CMakeFiles/main.dir/tests/cpp/main.cpp.o CMakeFiles/main.dir/tests/cpp/sift_1b.cpp.o -o main 

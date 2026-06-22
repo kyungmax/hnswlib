@@ -304,6 +304,33 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
     }
 
+    static constexpr tableint HIDDEN_NODE_NONE = std::numeric_limits<tableint>::max();
+
+    inline bool isHiddenNode(tableint internal_id, tableint hidden_internal_id) const {
+        return hidden_internal_id != HIDDEN_NODE_NONE && internal_id == hidden_internal_id;
+    }
+
+    tableint resolveEntryPointForHiddenNode(tableint hidden_internal_id) const {
+        if (cur_element_count == 0 || !isHiddenNode(enterpoint_node_, hidden_internal_id)) {
+            return enterpoint_node_;
+        }
+        tableint fallback = HIDDEN_NODE_NONE;
+        int fallback_level = -1;
+        for (tableint i = 0; i < cur_element_count; ++i) {
+            if (isHiddenNode(i, hidden_internal_id) || isMarkedDeleted(i)) {
+                continue;
+            }
+            if (element_levels_[i] > fallback_level) {
+                fallback = i;
+                fallback_level = element_levels_[i];
+                if (fallback_level >= maxlevel_) {
+                    break;
+                }
+            }
+        }
+        return fallback == HIDDEN_NODE_NONE ? enterpoint_node_ : fallback;
+    }
+
 
     int getRandomLevel(double reverse_size) {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
@@ -498,7 +525,8 @@ getLayer0NeighborsWithDistances() const {
         tableint ep_id,
         const void *data_point,
         size_t ef,
-        size_t k
+        size_t k,
+        tableint hidden_internal_id = HIDDEN_NODE_NONE
     ) const {
         std::vector<SearchStepInfo> path_info;
         size_t dist_count = 0; // 거리 계산 카운터
@@ -517,6 +545,11 @@ getLayer0NeighborsWithDistances() const {
         std::priority_queue<std::pair<dist_t, tableint>,
             std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
+        if (isHiddenNode(ep_id, hidden_internal_id)) {
+            visited_list_pool_->releaseVisitedList(vl);
+            return {path_info, 0, std::numeric_limits<dist_t>::infinity()};
+        }
+
         // --- 초기화 (원본 그대로) ---
         char* ep_data = getDataByInternalId(ep_id);
         dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
@@ -527,6 +560,9 @@ getLayer0NeighborsWithDistances() const {
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
+        if (hidden_internal_id != HIDDEN_NODE_NONE && hidden_internal_id < cur_element_count) {
+            visited_array[hidden_internal_id] = visited_array_tag;
+        }
 
         // --- 실제 search 루프 ---
         while (!candidate_set.empty()) {
@@ -628,7 +664,8 @@ getLayer0NeighborsWithDistances() const {
     searchKnnWithLayer0Trace(
         const void *query_data,
         size_t ef,
-        size_t k
+        size_t k,
+        tableint hidden_internal_id = HIDDEN_NODE_NONE
     ) const {
         size_t total_dist_count = 0;
         if (cur_element_count == 0) {
@@ -636,11 +673,17 @@ getLayer0NeighborsWithDistances() const {
         }
 
         // 1. Top layer → Layer 1 탐색 (Greedy)
-        tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        tableint currObj = resolveEntryPointForHiddenNode(hidden_internal_id);
+        if (isHiddenNode(currObj, hidden_internal_id)) {
+            return {std::vector<SearchStepInfo>(), 0, std::numeric_limits<dist_t>::infinity()};
+        }
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(currObj), dist_func_param_);
         total_dist_count++;
 
-        for (int level = maxlevel_; level > 0; level--) {
+        int start_level = currObj == enterpoint_node_
+            ? maxlevel_
+            : std::min(maxlevel_, element_levels_[currObj]);
+        for (int level = start_level; level > 0; level--) {
             bool changed = true;
             while (changed) {
                 changed = false;
@@ -650,6 +693,9 @@ getLayer0NeighborsWithDistances() const {
 
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
+                    if (isHiddenNode(cand, hidden_internal_id)) {
+                        continue;
+                    }
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     total_dist_count++;
 
@@ -664,7 +710,8 @@ getLayer0NeighborsWithDistances() const {
 
         // 2. Base layer 탐색 (상세 정보 포함)
         // searchBaseLayerSTWithTrace는 이미 std::vector<SearchStepInfo>를 반환하도록 작성됨
-        auto [path_info, base_dist_count, closest_dist] = searchBaseLayerSTWithTrace(currObj, query_data, ef, k);
+        auto [path_info, base_dist_count, closest_dist] =
+            searchBaseLayerSTWithTrace(currObj, query_data, ef, k, hidden_internal_id);
         total_dist_count += base_dist_count;
 
         return {path_info, total_dist_count, closest_dist};
@@ -1647,7 +1694,8 @@ searchKnnAdaptiveLight(
         const void *data_point,
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
-        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr,
+        tableint hidden_internal_id = HIDDEN_NODE_NONE) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -1656,6 +1704,10 @@ searchKnnAdaptiveLight(
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
+        if (isHiddenNode(ep_id, hidden_internal_id)) {
+            visited_list_pool_->releaseVisitedList(vl);
+            return top_candidates;
+        }
         if (bare_bone_search ||
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
@@ -1672,6 +1724,9 @@ searchKnnAdaptiveLight(
         }
 
         visited_array[ep_id] = visited_array_tag;
+        if (hidden_internal_id != HIDDEN_NODE_NONE && hidden_internal_id < cur_element_count) {
+            visited_array[hidden_internal_id] = visited_array_tag;
+        }
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -2603,14 +2658,31 @@ searchKnnAdaptiveLight(
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const override {
+        return searchKnnWithHiddenNode(query_data, k, isIdAllowed, HIDDEN_NODE_NONE);
+    }
+
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnWithHiddenNode(
+        const void *query_data,
+        size_t k,
+        BaseFilterFunctor* isIdAllowed,
+        tableint hidden_internal_id
+    ) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        tableint currObj = resolveEntryPointForHiddenNode(hidden_internal_id);
+        if (isHiddenNode(currObj, hidden_internal_id)) {
+            return result;
+        }
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(currObj), dist_func_param_);
 
-        for (int level = maxlevel_; level > 0; level--) {
+        int start_level = currObj == enterpoint_node_
+            ? maxlevel_
+            : std::min(maxlevel_, element_levels_[currObj]);
+        for (int level = start_level; level > 0; level--) {
             bool changed = true;
             while (changed) {
                 changed = false;
@@ -2624,6 +2696,9 @@ searchKnnAdaptiveLight(
                 tableint *datal = (tableint *) (data + 1);
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
+                    if (isHiddenNode(cand, hidden_internal_id)) {
+                        continue;
+                    }
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
@@ -2638,13 +2713,13 @@ searchKnnAdaptiveLight(
         }
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed && hidden_internal_id == HIDDEN_NODE_NONE;
         if (bare_bone_search) {
             top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, hidden_internal_id);
         } else {
             top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, hidden_internal_id);
         }
 
         while (top_candidates.size() > k) {
