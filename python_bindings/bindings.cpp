@@ -8,6 +8,8 @@
 
 #include <iostream>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <random>
 #include <pybind11/functional.h>
@@ -283,6 +285,10 @@ class Index {
         d["ef_half_dist"] = s.ef_half_dist;
         d["ef_quarter_dist"] = s.ef_quarter_dist;
         d["sqrt_ef_dist"] = s.sqrt_ef_dist;
+        d["shadow_64_dist"] = s.shadow_64_dist;
+        d["shadow_128_dist"] = s.shadow_128_dist;
+        d["shadow_256_dist"] = s.shadow_256_dist;
+        d["shadow_512_dist"] = s.shadow_512_dist;
         d["top_2k_dist"] = s.top_2k_dist;
         d["top_3k_dist"] = s.top_3k_dist;
         d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
@@ -311,6 +317,24 @@ class Index {
       default_ef = ef;
       if (appr_alg)
           appr_alg->ef_ = ef;
+    }
+
+    void enableBuildCfrLogging(
+        const std::string& summary_path,
+        const std::string& trajectory_path = std::string(),
+        size_t trajectory_sample_rate = 0
+    ) {
+        if (!appr_alg) {
+            throw std::runtime_error("Index is not initialized.");
+        }
+        appr_alg->enableBuildCfrLogging(summary_path, trajectory_path, trajectory_sample_rate);
+    }
+
+    void disableBuildCfrLogging() {
+        if (!appr_alg) {
+            return;
+        }
+        appr_alg->disableBuildCfrLogging();
     }
 
 
@@ -727,6 +751,132 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         };
     }
 
+    // Efficient offline-calibration summary: runs the same layer-0 trace search
+    // as searchLayer0PathHideNodeBatchWithMetrics, but aggregates the classify-
+    // window smoothed-CHR mean entirely in C++ (no per-step py::dict marshaling).
+    // Mirrors Faiss IndexHNSW::search_layer0_chr_summary in name, signature and
+    // return keys so the shared calibrator can use one API across both backends.
+    // The aggregation is a line-for-line port of the calibrator's former Python
+    // trace loop, so calibrated thresholds are unchanged (values identical up to
+    // float rounding).
+    py::dict searchLayer0ChrSummary(
+        py::object input,
+        size_t k,
+        size_t ef,
+        py::object hide_labels = py::none(),
+        int num_threads = -1
+    ) {
+        static constexpr int CLASSIFY_START = 4;
+        static constexpr int CLASSIFY_END = 16;
+        static constexpr double CHR_EMA_DECAY = 0.8;
+        static constexpr double CHR_EMA_UPDATE = 1.0 - CHR_EMA_DECAY;
+
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+        std::vector<hnswlib::tableint> hidden_internal_ids = resolveHiddenLabels(hide_labels, rows);
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        auto full_pop_counts = py::array_t<uint64_t>(rows);
+        auto window_obs_counts = py::array_t<uint64_t>(rows);
+        auto usable_flags = py::array_t<uint64_t>(rows);
+        auto distance_counts = py::array_t<uint64_t>(rows);
+        auto mean_smoothed_cfrs = py::array_t<float>(rows);
+        auto closest_dists = py::array_t<float>(rows);
+
+        uint64_t* fpc = (uint64_t*)full_pop_counts.request().ptr;
+        uint64_t* woc = (uint64_t*)window_obs_counts.request().ptr;
+        uint64_t* uf = (uint64_t*)usable_flags.request().ptr;
+        uint64_t* dc = (uint64_t*)distance_counts.request().ptr;
+        float* msc = (float*)mean_smoothed_cfrs.request().ptr;
+        float* cd = (float*)closest_dists.request().ptr;
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                auto [steps, count, closest_dist] =
+                    appr_alg->searchKnnWithLayer0Trace(query_ptr, ef, k, hidden_internal_ids[row]);
+
+                // Aggregate the classify-window smoothed-CHR mean in double (same
+                // precision as the former Python trace loop, which read float32
+                // step fields as Python doubles).
+                double ema = std::numeric_limits<double>::quiet_NaN();
+                int observed_full_pop = 0;
+                int window_obs = 0;
+                double window_sum = 0.0;
+                for (const auto& s : steps) {
+                    if (s.result_set_size_after < ef) {
+                        continue;  // not a full pop yet
+                    }
+                    observed_full_pop += 1;
+
+                    double popped = (double)s.popped_query_dist;
+                    double furthest = (double)s.furthest_dist;
+                    double chr = std::numeric_limits<double>::quiet_NaN();
+                    if (std::isfinite(popped) && std::isfinite(furthest) &&
+                        std::fabs(furthest) > 1e-12) {
+                        chr = std::fabs(popped) / std::fabs(furthest);
+                    }
+                    if (std::isfinite(chr)) {
+                        if (std::isnan(ema)) {
+                            ema = chr;
+                        } else {
+                            ema = CHR_EMA_DECAY * ema + CHR_EMA_UPDATE * chr;
+                        }
+                    }
+                    if (observed_full_pop >= CLASSIFY_START &&
+                        observed_full_pop <= CLASSIFY_END && std::isfinite(ema)) {
+                        window_sum += ema;
+                        window_obs += 1;
+                    }
+                    if (observed_full_pop >= CLASSIFY_END) {
+                        break;
+                    }
+                }
+
+                double mean_window = window_obs > 0
+                    ? window_sum / (double)window_obs
+                    : std::numeric_limits<double>::quiet_NaN();
+                bool usable = (observed_full_pop >= CLASSIFY_END) &&
+                    std::isfinite(mean_window);
+
+                fpc[row] = (uint64_t)std::min(observed_full_pop, CLASSIFY_END);
+                woc[row] = (uint64_t)window_obs;
+                uf[row] = usable ? 1u : 0u;
+                dc[row] = (uint64_t)count;
+                msc[row] = (float)mean_window;
+                cd[row] = closest_dist;
+            });
+        }
+
+        py::dict out;
+        out["full_pop_counts"] = full_pop_counts;
+        out["window_obs_counts"] = window_obs_counts;
+        out["usable_flags"] = usable_flags;
+        out["distance_counts"] = distance_counts;
+        out["mean_smoothed_cfrs"] = mean_smoothed_cfrs;
+        out["closest_dists"] = closest_dists;
+        return out;
+    }
+
     py::object knnQueryAdaptiveAnalysis(
         py::object input,
         size_t k = 1,
@@ -818,6 +968,105 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
             py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
             py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
             py::int_(total_stop_count.load(std::memory_order_relaxed))
+        );
+    }
+
+    py::object knnQueryBeamWidthFirstTargetHitStep(
+        py::object input,
+        py::object target_labels_obj,
+        py::object target_hits_obj,
+        size_t k = 1,
+        size_t ef_before = 128,
+        size_t switch_pop = 0,
+        size_t switch_full_pop = 0,
+        size_t ef_after = 128,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> items(input);
+        py::array_t<hnswlib::labeltype, py::array::c_style | py::array::forcecast> target_labels_arr(target_labels_obj);
+        py::array_t<size_t, py::array::c_style | py::array::forcecast> target_hits_arr(target_hits_obj);
+
+        auto buffer = items.request();
+        auto target_labels_req = target_labels_arr.request();
+        auto target_hits_req = target_hits_arr.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (target_labels_req.ndim != 2 || (size_t)target_labels_req.shape[0] != rows) {
+            throw std::runtime_error("target_labels must have shape [num_queries, target_k]");
+        }
+        if (target_hits_req.ndim != 1 || (size_t)target_hits_req.shape[0] != rows) {
+            throw std::runtime_error("target_hits must have shape [num_queries]");
+        }
+
+        const size_t target_label_count = (size_t)target_labels_req.shape[1];
+        hnswlib::labeltype* target_labels_ptr = (hnswlib::labeltype*)target_labels_req.ptr;
+        size_t* target_hits_ptr = (size_t*)target_hits_req.ptr;
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        if (rows <= (size_t)num_threads * 4) {
+            num_threads = 1;
+        }
+
+        size_t* data_numpy_first_steps = new size_t[rows];
+        size_t* data_numpy_reached_flags = new size_t[rows];
+        size_t* data_numpy_achieved_hits = new size_t[rows];
+        std::atomic<size_t> total_reached_count(0);
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                const hnswlib::labeltype* row_target_labels = target_labels_ptr + row * target_label_count;
+                const size_t row_target_hits = target_hits_ptr[row];
+                auto hit_step_stats = appr_alg->searchKnnBeamWidthFirstTargetHitStep(
+                    query_ptr,
+                    k,
+                    ef_before,
+                    switch_pop,
+                    switch_full_pop,
+                    ef_after,
+                    row_target_labels,
+                    target_label_count,
+                    row_target_hits,
+                    p_idFilter
+                );
+
+                data_numpy_first_steps[row] = hit_step_stats.first_target_hit_step;
+                data_numpy_reached_flags[row] = hit_step_stats.reached_target;
+                data_numpy_achieved_hits[row] = hit_step_stats.achieved_hit_count;
+                total_reached_count.fetch_add(hit_step_stats.reached_target, std::memory_order_relaxed);
+            });
+        }
+
+        py::capsule free_when_done_first_steps(data_numpy_first_steps, [](void* f) { delete[] (size_t*)f; });
+        py::capsule free_when_done_reached_flags(data_numpy_reached_flags, [](void* f) { delete[] (size_t*)f; });
+        py::capsule free_when_done_achieved_hits(data_numpy_achieved_hits, [](void* f) { delete[] (size_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_first_steps, free_when_done_first_steps),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reached_flags, free_when_done_reached_flags),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_achieved_hits, free_when_done_achieved_hits),
+            py::int_(total_reached_count.load(std::memory_order_relaxed))
         );
     }
 
@@ -928,6 +1177,219 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         );
     }
 
+    py::object knnQueryAdaptiveAnalysisPaperBucket(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 128,
+        size_t ef_max = 1024,
+        size_t tmin_pops = 64,
+        bool enable_stop = true,
+        size_t stop_step = 0,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        size_t paper_bucket_count = 4,
+        const std::vector<float>& bucket_gamma_ratios = std::vector<float>()
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        hnswlib::HierarchicalNSW<dist_t>::validatePaperBucketRoutingConfig(
+            paper_bucket_count,
+            bucket_gamma_ratios
+        );
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        if (rows <= (size_t)num_threads * 4) {
+            num_threads = 1;
+        }
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+        size_t* data_numpy_reduced_steps = new size_t[rows];
+        std::atomic<size_t> total_stop_count(0);
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                auto adaptive_output = appr_alg->searchKnnAdaptiveAnalysisPaperBucket(
+                    query_ptr,
+                    k,
+                    ef_init,
+                    ef_max,
+                    tmin_pops,
+                    enable_stop,
+                    stop_step,
+                    p_idFilter,
+                    early_stop_ratio,
+                    paper_bucket_count,
+                    bucket_gamma_ratios
+                );
+                auto result = std::move(adaptive_output.result);
+                data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
+                total_stop_count.fetch_add(adaptive_output.stats.stop_count, std::memory_order_relaxed);
+
+                if (result.size() != k) {
+                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                }
+
+                for (int i = (int)k - 1; i >= 0; i--) {
+                    data_numpy_d[row * k + i] = result.top().first;
+                    data_numpy_l[row * k + i] = result.top().second;
+                    result.pop();
+                }
+            });
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+        py::capsule free_when_done_reduced(data_numpy_reduced_steps, [](void* f) { delete[] (size_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
+            py::int_(total_stop_count.load(std::memory_order_relaxed))
+        );
+    }
+
+    py::object knnQueryAdaptiveAnalysisWithTracePaperBucket(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 128,
+        size_t ef_max = 1024,
+        size_t tmin_pops = 64,
+        bool enable_stop = true,
+        size_t stop_step = 0,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        size_t paper_bucket_count = 4,
+        const std::vector<float>& bucket_gamma_ratios = std::vector<float>()
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        hnswlib::HierarchicalNSW<dist_t>::validatePaperBucketRoutingConfig(
+            paper_bucket_count,
+            bucket_gamma_ratios
+        );
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        if (rows <= (size_t)num_threads * 4) {
+            num_threads = 1;
+        }
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+        size_t* data_numpy_reduced_steps = new size_t[rows];
+        size_t* data_numpy_stop_flags = new size_t[rows];
+        std::atomic<size_t> total_stop_count(0);
+        std::vector<std::vector<hnswlib::SearchStepInfo>> raw_paths(rows);
+
+        {
+            std::vector<float> norm_array;
+            if (normalize) {
+                norm_array.resize((size_t)num_threads * features);
+            }
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            py::gil_scoped_release l;
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                const float* query_ptr = (const float*)items.data(row);
+                if (normalize) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+                    query_ptr = norm_array.data() + start_idx;
+                }
+
+                auto adaptive_output = appr_alg->searchKnnAdaptiveAnalysisPaperBucket(
+                    query_ptr,
+                    k,
+                    ef_init,
+                    ef_max,
+                    tmin_pops,
+                    enable_stop,
+                    stop_step,
+                    p_idFilter,
+                    early_stop_ratio,
+                    paper_bucket_count,
+                    bucket_gamma_ratios
+                );
+                raw_paths[row] = std::move(adaptive_output.path_info);
+                auto result = std::move(adaptive_output.result);
+                data_numpy_reduced_steps[row] = adaptive_output.stats.reduced_steps;
+                data_numpy_stop_flags[row] = adaptive_output.stats.stop_count;
+                total_stop_count.fetch_add(adaptive_output.stats.stop_count, std::memory_order_relaxed);
+
+                if (result.size() != k) {
+                    throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                }
+
+                for (int i = (int)k - 1; i >= 0; i--) {
+                    data_numpy_d[row * k + i] = result.top().first;
+                    data_numpy_l[row * k + i] = result.top().second;
+                    result.pop();
+                }
+            });
+        }
+
+        std::vector<std::vector<py::dict>> py_paths(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            std::vector<py::dict> py_steps;
+            py_steps.reserve(raw_paths[i].size());
+            for (auto& s : raw_paths[i]) {
+                py_steps.push_back(searchStepInfoToDict(s));
+            }
+            py_paths[i] = std::move(py_steps);
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+        py::capsule free_when_done_reduced(data_numpy_reduced_steps, [](void* f) { delete[] (size_t*)f; });
+        py::capsule free_when_done_stop_flags(data_numpy_stop_flags, [](void* f) { delete[] (size_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_reduced_steps, free_when_done_reduced),
+            py::array_t<size_t>({ rows }, { (ssize_t)sizeof(size_t) }, data_numpy_stop_flags, free_when_done_stop_flags),
+            py::int_(total_stop_count.load(std::memory_order_relaxed)),
+            py::cast(std::move(py_paths))
+        );
+    }
+
+    // Adaptive-light intentionally returns only (labels, distances).
+    // It does not expose reduced-step or stop-count statistics.
     py::object knnQueryAdaptiveLight(
         py::object input,
         size_t k = 1,
@@ -938,7 +1400,10 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         float early_stop_ratio = 0.6f,
         size_t tmin_pops = 25,
         float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
-        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
     ) {
         if (appr_alg->cur_element_count == 0) {
             throw std::runtime_error("Index is empty. Cannot perform search.");
@@ -977,7 +1442,10 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                         early_stop_ratio,
                         tmin_pops,
                         super_easy_gamma_ratio,
-                        mid_easy_upper_gamma_ratio
+                        mid_easy_upper_gamma_ratio,
+                        classify_start,
+                        classify_end,
+                        chr_ema_decay
                     );
 
                     if (result.size() != k) {
@@ -1005,7 +1473,10 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
                         early_stop_ratio,
                         tmin_pops,
                         super_easy_gamma_ratio,
-                        mid_easy_upper_gamma_ratio
+                        mid_easy_upper_gamma_ratio,
+                        classify_start,
+                        classify_end,
+                        chr_ema_decay
                     );
 
                     if (result.size() != k) {
@@ -1022,6 +1493,121 @@ std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py:
         }
 
         // 작성하신 안전한 메모리 해제 유지 (이게 Baseline보다 낫습니다)
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>({ rows, k }, { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) }, data_numpy_l, free_when_done_l),
+            py::array_t<dist_t>({ rows, k }, { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) }, data_numpy_d, free_when_done_d)
+        );
+    }
+
+    py::object knnQueryAdaptiveLightPaperBucket(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 128,
+        bool enable_stop = true,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr,
+        float early_stop_ratio = 0.6f,
+        size_t tmin_pops = 25,
+        size_t paper_bucket_count = 4,
+        const std::vector<float>& bucket_gamma_ratios = std::vector<float>(),
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
+    ) {
+        if (appr_alg->cur_element_count == 0) {
+            throw std::runtime_error("Index is empty. Cannot perform search.");
+        }
+
+        hnswlib::HierarchicalNSW<dist_t>::validatePaperBucketRoutingConfig(
+            paper_bucket_count,
+            bucket_gamma_ratios
+        );
+
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
+
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            if (num_threads <= 0) num_threads = num_threads_default;
+            if (rows <= (size_t)num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    auto result = appr_alg->searchKnnAdaptiveLightPaperBucket(
+                        (const float*)items.data(row),
+                        k,
+                        ef_init,
+                        enable_stop,
+                        p_idFilter,
+                        early_stop_ratio,
+                        tmin_pops,
+                        paper_bucket_count,
+                        bucket_gamma_ratios,
+                        classify_start,
+                        classify_end,
+                        chr_ema_decay
+                    );
+
+                    if (result.size() != k) {
+                        throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    }
+
+                    for (int i = (int)k - 1; i >= 0; i--) {
+                        data_numpy_d[row * k + i] = result.top().first;
+                        data_numpy_l[row * k + i] = result.top().second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array((size_t)num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * features;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    auto result = appr_alg->searchKnnAdaptiveLightPaperBucket(
+                        (const float*)(norm_array.data() + start_idx),
+                        k,
+                        ef_init,
+                        enable_stop,
+                        p_idFilter,
+                        early_stop_ratio,
+                        tmin_pops,
+                        paper_bucket_count,
+                        bucket_gamma_ratios,
+                        classify_start,
+                        classify_end,
+                        chr_ema_decay
+                    );
+
+                    if (result.size() != k) {
+                        throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    }
+
+                    for (int i = (int)k - 1; i >= 0; i--) {
+                        data_numpy_d[row * k + i] = result.top().first;
+                        data_numpy_l[row * k + i] = result.top().second;
+                        result.pop();
+                    }
+                });
+            }
+        }
+
         py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
         py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
 
@@ -1849,6 +2435,34 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
             py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
         )
+        .def("knn_query_adaptive_analysis_paper_bucket",
+            &Index<float>::knnQueryAdaptiveAnalysisPaperBucket,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
+            py::arg("ef_max") = 1024,
+            py::arg("tmin_pops") = 64,
+            py::arg("enable_stop") = true,
+            py::arg("stop_step") = 0,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("paper_bucket_count") = 4,
+            py::arg("bucket_gamma_ratios") = std::vector<float>()
+        )
+        .def("knn_query_beam_width_first_target_hit_step",
+            &Index<float>::knnQueryBeamWidthFirstTargetHitStep,
+            py::arg("data"),
+            py::arg("target_labels"),
+            py::arg("target_hits"),
+            py::arg("k") = 1,
+            py::arg("ef_before") = 128,
+            py::arg("switch_pop") = 0,
+            py::arg("switch_full_pop") = 0,
+            py::arg("ef_after") = 128,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none()
+        )
         .def("knn_query_adaptive_analysis_with_trace",
             &Index<float>::knnQueryAdaptiveAnalysisWithTrace,
             py::arg("data"),
@@ -1864,8 +2478,29 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
             py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
         )
+        .def("knn_query_adaptive_analysis_with_trace_paper_bucket",
+            &Index<float>::knnQueryAdaptiveAnalysisWithTracePaperBucket,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
+            py::arg("ef_max") = 1024,
+            py::arg("tmin_pops") = 64,
+            py::arg("enable_stop") = true,
+            py::arg("stop_step") = 0,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("paper_bucket_count") = 4,
+            py::arg("bucket_gamma_ratios") = std::vector<float>()
+        )
         .def("knn_query_adaptive_light",
             &Index<float>::knnQueryAdaptiveLight,
+            R"pbdoc(
+Returns `(labels, distances)` for adaptive-light search.
+
+Unlike `knn_query_adaptive_analysis`, this lightweight API does not expose
+per-query reduced-step arrays or aggregate stop counts.
+)pbdoc",
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("ef_init") = 128,
@@ -1875,7 +2510,54 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("early_stop_ratio") = 0.6f,
             py::arg("tmin_pops") = 25,
             py::arg("super_easy_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
-            py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN()
+            py::arg("mid_easy_upper_gamma_ratio") = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("classify_start") = 4,
+            py::arg("classify_end") = 16,
+            py::arg("chr_ema_decay") = 0.8f
+        )
+        .def("knn_query_adaptive_light_paper_bucket",
+            &Index<float>::knnQueryAdaptiveLightPaperBucket,
+            R"pbdoc(
+Returns `(labels, distances)` for adaptive-light paper-bucket ablation search.
+
+This ablation-only API routes easy queries to floor((j / B) * efSearch)
+using a switch-based bucket selector at classify time.
+)pbdoc",
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
+            py::arg("enable_stop") = true,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("tmin_pops") = 25,
+            py::arg("paper_bucket_count") = 4,
+            py::arg("bucket_gamma_ratios") = std::vector<float>(),
+            py::arg("classify_start") = 4,
+            py::arg("classify_end") = 16,
+            py::arg("chr_ema_decay") = 0.8f
+        )
+        .def("knn_query_sage",
+            &Index<float>::knnQueryAdaptiveLightPaperBucket,
+            R"pbdoc(
+Returns `(labels, distances)` for the final SAGE online search path.
+
+This is the production-facing alias for adaptive-light paper-bucket routing.
+Legacy experiment scripts may still call `knn_query_adaptive_light_paper_bucket`.
+)pbdoc",
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 128,
+            py::arg("enable_stop") = true,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none(),
+            py::arg("early_stop_ratio") = 0.6f,
+            py::arg("tmin_pops") = 25,
+            py::arg("paper_bucket_count") = 4,
+            py::arg("bucket_gamma_ratios") = std::vector<float>(),
+            py::arg("classify_start") = 4,
+            py::arg("classify_end") = 16,
+            py::arg("chr_ema_decay") = 0.8f
         )
         .def("get_layer_edges_parallel",
             &Index<float>::getLayerEdgesParallel,
@@ -1960,6 +2642,10 @@ PYBIND11_PLUGIN(hnswlib) {
                     d["ef_half_dist"] = s.ef_half_dist;
                     d["ef_quarter_dist"] = s.ef_quarter_dist;
                     d["sqrt_ef_dist"] = s.sqrt_ef_dist;
+                    d["shadow_64_dist"] = s.shadow_64_dist;
+                    d["shadow_128_dist"] = s.shadow_128_dist;
+                    d["shadow_256_dist"] = s.shadow_256_dist;
+                    d["shadow_512_dist"] = s.shadow_512_dist;
                     d["top_2k_dist"] = s.top_2k_dist;
                     d["top_3k_dist"] = s.top_3k_dist;
                     d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
@@ -2002,9 +2688,23 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("hide_labels"),
             py::arg("num_threads") = -1
         )
+        .def("search_layer0_chr_summary",
+            &Index<float>::searchLayer0ChrSummary,
+            py::arg("data"),
+            py::arg("k"),
+            py::arg("ef"),
+            py::arg("hide_labels") = py::none(),
+            py::arg("num_threads") = -1
+        )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
+        .def("enable_build_cfr_logging",
+            &Index<float>::enableBuildCfrLogging,
+            py::arg("summary_path"),
+            py::arg("trajectory_path") = std::string(),
+            py::arg("trajectory_sample_rate") = 0)
+        .def("disable_build_cfr_logging", &Index<float>::disableBuildCfrLogging)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
