@@ -319,24 +319,6 @@ class Index {
           appr_alg->ef_ = ef;
     }
 
-    void enableBuildCfrLogging(
-        const std::string& summary_path,
-        const std::string& trajectory_path = std::string(),
-        size_t trajectory_sample_rate = 0
-    ) {
-        if (!appr_alg) {
-            throw std::runtime_error("Index is not initialized.");
-        }
-        appr_alg->enableBuildCfrLogging(summary_path, trajectory_path, trajectory_sample_rate);
-    }
-
-    void disableBuildCfrLogging() {
-        if (!appr_alg) {
-            return;
-        }
-        appr_alg->disableBuildCfrLogging();
-    }
-
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -2699,12 +2681,6 @@ Legacy experiment scripts may still call `knn_query_adaptive_light_paper_bucket`
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
-        .def("enable_build_cfr_logging",
-            &Index<float>::enableBuildCfrLogging,
-            py::arg("summary_path"),
-            py::arg("trajectory_path") = std::string(),
-            py::arg("trajectory_sample_rate") = 0)
-        .def("disable_build_cfr_logging", &Index<float>::disableBuildCfrLogging)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))

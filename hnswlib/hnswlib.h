@@ -154,6 +154,10 @@ struct SearchStepInfo {
     float ef_half_dist;             // 현재 pop step 처리 후 ef/2번째 거리
     float ef_quarter_dist;          // 현재 pop step 처리 후 ef/4번째 거리
     float sqrt_ef_dist;             // 현재 pop step 처리 후 sqrt(ef)번째 거리
+    float shadow_64_dist;           // 현재 pop step 처리 후 top-64의 64번째 거리
+    float shadow_128_dist;          // 현재 pop step 처리 후 top-128의 128번째 거리
+    float shadow_256_dist;          // 현재 pop step 처리 후 top-256의 256번째 거리
+    float shadow_512_dist;          // 현재 pop step 처리 후 top-512의 512번째 거리
     float top_2k_dist;              // 현재 pop step 처리 후 top-2k의 2k번째 거리
     float top_3k_dist;              // 현재 pop step 처리 후 top-3k의 3k번째 거리
     std::vector<float> furthest_vec; // 현재 결과 집합 중 가장 먼 노드의 벡터

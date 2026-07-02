@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <tuple>
+#include <fstream>
 
 namespace hnswlib {
 typedef unsigned int linklistsizeint;
@@ -196,6 +197,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<SearchStepInfo> path_info;
     };
 
+    struct TargetHitStepStats {
+        size_t first_target_hit_step = 0;
+        size_t target_hit_count = 0;
+        size_t achieved_hit_count = 0;
+        size_t reached_target = 0;
+    };
+
     static size_t resolveScaledShrinkEf(
         size_t configured_ef,
         double scale,
@@ -203,6 +211,108 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     ) {
         const size_t raw_ef = (size_t)std::llround((double)configured_ef * scale);
         return std::min(configured_ef, std::max(min_ef, raw_ef));
+    }
+
+    static void validatePaperBucketRoutingConfig(
+        size_t paper_bucket_count,
+        const std::vector<float>& paper_bucket_gamma_ratios
+    ) {
+        if (paper_bucket_count < 2 || paper_bucket_count > 8) {
+            throw std::invalid_argument("paper_bucket_count must be in [2, 8].");
+        }
+        if (paper_bucket_gamma_ratios.size() != paper_bucket_count - 1) {
+            throw std::invalid_argument(
+                "bucket_gamma_ratios must contain exactly paper_bucket_count - 1 entries."
+            );
+        }
+        float prev_gamma = -std::numeric_limits<float>::infinity();
+        for (float gamma : paper_bucket_gamma_ratios) {
+            if (!std::isfinite(gamma)) {
+                throw std::invalid_argument("bucket_gamma_ratios must be finite.");
+            }
+            if (gamma < 0.0f || gamma > 1.0f) {
+                throw std::invalid_argument("bucket_gamma_ratios must lie in [0, 1].");
+            }
+            if (gamma < prev_gamma) {
+                throw std::invalid_argument(
+                    "bucket_gamma_ratios must be monotone nondecreasing."
+                );
+            }
+            prev_gamma = gamma;
+        }
+    }
+
+    static size_t resolvePaperBucketShrinkEf(
+        size_t configured_ef,
+        size_t k,
+        size_t paper_bucket_count,
+        float classify_chr_ratio,
+        const std::vector<float>& paper_bucket_gamma_ratios
+    ) {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float g1 = paper_bucket_gamma_ratios.size() > 0 ? paper_bucket_gamma_ratios[0] : nan;
+        const float g2 = paper_bucket_gamma_ratios.size() > 1 ? paper_bucket_gamma_ratios[1] : nan;
+        const float g3 = paper_bucket_gamma_ratios.size() > 2 ? paper_bucket_gamma_ratios[2] : nan;
+        const float g4 = paper_bucket_gamma_ratios.size() > 3 ? paper_bucket_gamma_ratios[3] : nan;
+        const float g5 = paper_bucket_gamma_ratios.size() > 4 ? paper_bucket_gamma_ratios[4] : nan;
+        const float g6 = paper_bucket_gamma_ratios.size() > 5 ? paper_bucket_gamma_ratios[5] : nan;
+        const float g7 = paper_bucket_gamma_ratios.size() > 6 ? paper_bucket_gamma_ratios[6] : nan;
+
+        size_t selected_bucket_index = paper_bucket_count - 1;
+        switch (paper_bucket_count) {
+            case 2:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                break;
+            case 3:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                break;
+            case 4:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                else if (classify_chr_ratio <= g3) selected_bucket_index = 2;
+                break;
+            case 5:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                else if (classify_chr_ratio <= g3) selected_bucket_index = 2;
+                else if (classify_chr_ratio <= g4) selected_bucket_index = 3;
+                break;
+            case 6:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                else if (classify_chr_ratio <= g3) selected_bucket_index = 2;
+                else if (classify_chr_ratio <= g4) selected_bucket_index = 3;
+                else if (classify_chr_ratio <= g5) selected_bucket_index = 4;
+                break;
+            case 7:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                else if (classify_chr_ratio <= g3) selected_bucket_index = 2;
+                else if (classify_chr_ratio <= g4) selected_bucket_index = 3;
+                else if (classify_chr_ratio <= g5) selected_bucket_index = 4;
+                else if (classify_chr_ratio <= g6) selected_bucket_index = 5;
+                break;
+            case 8:
+                if (classify_chr_ratio <= g1) selected_bucket_index = 0;
+                else if (classify_chr_ratio <= g2) selected_bucket_index = 1;
+                else if (classify_chr_ratio <= g3) selected_bucket_index = 2;
+                else if (classify_chr_ratio <= g4) selected_bucket_index = 3;
+                else if (classify_chr_ratio <= g5) selected_bucket_index = 4;
+                else if (classify_chr_ratio <= g6) selected_bucket_index = 5;
+                else if (classify_chr_ratio <= g7) selected_bucket_index = 6;
+                break;
+            default:
+                throw std::invalid_argument("paper_bucket_count must be in [2, 8].");
+        }
+
+        if (selected_bucket_index + 1 >= paper_bucket_count) {
+            return configured_ef;
+        }
+        size_t routed_ef = (configured_ef * (selected_bucket_index + 1)) / paper_bucket_count;
+        routed_ef = std::max((size_t)1, routed_ef);
+        routed_ef = std::min(configured_ef, routed_ef);
+        return std::max(routed_ef, k);
     }
 
     static float rankDistanceOrNaN(
@@ -213,6 +323,47 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return std::numeric_limits<float>::quiet_NaN();
         }
         return (float)sorted_candidates[rank - 1].first;
+    }
+
+    size_t computeTopKTargetHitCount(
+        const std::priority_queue<std::pair<dist_t, tableint>,
+                                  std::vector<std::pair<dist_t, tableint>>,
+                                  CompareByFirst>& top_candidates,
+        size_t k,
+        const labeltype* target_labels,
+        size_t target_label_count
+    ) const {
+        if (target_labels == nullptr || target_label_count == 0 || top_candidates.empty()) {
+            return 0;
+        }
+
+        auto snapshot = top_candidates;
+        std::vector<std::pair<dist_t, tableint>> sorted_candidates;
+        sorted_candidates.reserve(snapshot.size());
+        while (!snapshot.empty()) {
+            sorted_candidates.push_back(snapshot.top());
+            snapshot.pop();
+        }
+        std::sort(
+            sorted_candidates.begin(),
+            sorted_candidates.end(),
+            [](const std::pair<dist_t, tableint>& lhs, const std::pair<dist_t, tableint>& rhs) {
+                return lhs.first < rhs.first;
+            }
+        );
+
+        const size_t limit = std::min(k, sorted_candidates.size());
+        size_t hit_count = 0;
+        for (size_t i = 0; i < limit; ++i) {
+            const labeltype candidate_label = getExternalLabel(sorted_candidates[i].second);
+            for (size_t j = 0; j < target_label_count; ++j) {
+                if (candidate_label == target_labels[j]) {
+                    hit_count++;
+                    break;
+                }
+            }
+        }
+        return hit_count;
     }
 
     void fillTraceStepMetrics(
@@ -231,6 +382,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         step.ef_half_dist = std::numeric_limits<float>::quiet_NaN();
         step.ef_quarter_dist = std::numeric_limits<float>::quiet_NaN();
         step.sqrt_ef_dist = std::numeric_limits<float>::quiet_NaN();
+        step.shadow_64_dist = std::numeric_limits<float>::quiet_NaN();
+        step.shadow_128_dist = std::numeric_limits<float>::quiet_NaN();
+        step.shadow_256_dist = std::numeric_limits<float>::quiet_NaN();
+        step.shadow_512_dist = std::numeric_limits<float>::quiet_NaN();
         step.top_2k_dist = std::numeric_limits<float>::quiet_NaN();
         step.top_3k_dist = std::numeric_limits<float>::quiet_NaN();
         step.furthest_vec.clear();
@@ -262,6 +417,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         step.ef_half_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, ef / 2));
         step.ef_quarter_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, ef / 4));
         step.sqrt_ef_dist = rankDistanceOrNaN(sorted_candidates, std::max<size_t>(1, (size_t)std::sqrt((double)ef)));
+        step.shadow_64_dist = rankDistanceOrNaN(sorted_candidates, 64);
+        step.shadow_128_dist = rankDistanceOrNaN(sorted_candidates, 128);
+        step.shadow_256_dist = rankDistanceOrNaN(sorted_candidates, 256);
+        step.shadow_512_dist = rankDistanceOrNaN(sorted_candidates, 512);
         step.top_2k_dist = rankDistanceOrNaN(sorted_candidates, k * 2);
         step.top_3k_dist = rankDistanceOrNaN(sorted_candidates, k * 3);
 
@@ -303,6 +462,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     inline char *getDataByInternalId(tableint internal_id) const {
         return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
     }
+
 
     static constexpr tableint HIDDEN_NODE_NONE = std::numeric_limits<tableint>::max();
 
@@ -804,7 +964,7 @@ getLayer0NeighborsWithDistances() const {
  *   HARD query:  stop at stagnation >= 20
  */
 
-template <bool bare_bone_search>
+template <bool bare_bone_search, bool paper_bucket_mode>
 AdaptiveSearchResult
 searchBaseLayerAdaptiveAnalysisCore(
     tableint ep_id,
@@ -818,7 +978,12 @@ searchBaseLayerAdaptiveAnalysisCore(
     float  early_stop_ratio,
     BaseFilterFunctor* isIdAllowed,
     float  super_easy_gamma_ratio,
-    float  mid_easy_upper_gamma_ratio
+    float  mid_easy_upper_gamma_ratio,
+    size_t paper_bucket_count,
+    const std::vector<float>& paper_bucket_gamma_ratios,
+    int    classify_start = 4,
+    int    classify_end = 16,
+    float  chr_ema_decay = 0.8f
 ) const {
     AdaptiveSearchResult output;
     static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
@@ -837,19 +1002,22 @@ searchBaseLayerAdaptiveAnalysisCore(
     size_t pop_count         = 0;
     int    stagnation_count  = 0;
     float  prev_furthest     = std::numeric_limits<float>::max();
-    static constexpr int   CLASSIFY_START   = 4;
-    static constexpr int   CLASSIFY_END     = 16;
-    static constexpr float CHR_EMA_DECAY = 0.8f;
-    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+    const int   CLASSIFY_START = classify_start;
+    const int   CLASSIFY_END = classify_end;
+    const float CHR_EMA_DECAY = chr_ema_decay;
+    const float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
     float smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
     float classify_smoothed_chr_sum = 0.0f;
     int   classify_smoothed_chr_count = 0;
     float classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
     const bool direct_classifier_threshold_enabled = std::isfinite(early_stop_ratio);
     const bool super_easy_policy_enabled =
-        direct_classifier_threshold_enabled && std::isfinite(super_easy_gamma_ratio);
+        !paper_bucket_mode
+        && direct_classifier_threshold_enabled
+        && std::isfinite(super_easy_gamma_ratio);
     const bool mid_easy_bucket_policy_enabled =
-        direct_classifier_threshold_enabled
+        !paper_bucket_mode
+        && direct_classifier_threshold_enabled
         && std::isfinite(mid_easy_upper_gamma_ratio);
     const int effective_tmin_pops =
         direct_classifier_threshold_enabled
@@ -1016,38 +1184,54 @@ searchBaseLayerAdaptiveAnalysisCore(
                         if (is_easy_query) {
                             float classify_chr_ratio =
                                 classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
-                            if (super_easy_policy_enabled) {
-                                is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
-                            }
-                            if (mid_easy_bucket_policy_enabled) {
-                                is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                            if constexpr (!paper_bucket_mode) {
+                                if (super_easy_policy_enabled) {
+                                    is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
+                                }
+                                if (mid_easy_bucket_policy_enabled) {
+                                    is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                                }
                             }
                         }
                     }
 
                     if (ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK && !effective_ef_shrink_applied) {
                         size_t shrunk_ef_cur = configured_ef_cur;
-                        const size_t shrink_super_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
-                        const size_t shrink_easy_ef =
-                            std::max((size_t)1, configured_ef_cur / (size_t)2);
-                        const size_t shrink_mid_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
-                        const size_t shrink_edge_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
-
-                        if (super_easy_policy_enabled && is_super_easy_query) {
-                            shrunk_ef_cur = shrink_super_easy_ef;
-                        } else if (is_easy_query) {
-                            if (mid_easy_bucket_policy_enabled) {
-                                shrunk_ef_cur = is_mid_easy_query
-                                    ? shrink_mid_easy_ef
-                                    : shrink_edge_easy_ef;
-                            } else {
-                                shrunk_ef_cur = shrink_easy_ef;
+                        if constexpr (paper_bucket_mode) {
+                            if (is_easy_query) {
+                                const float classify_chr_ratio =
+                                    classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
+                                shrunk_ef_cur = resolvePaperBucketShrinkEf(
+                                    configured_ef_cur,
+                                    k,
+                                    paper_bucket_count,
+                                    classify_chr_ratio,
+                                    paper_bucket_gamma_ratios
+                                );
                             }
+                        } else {
+                            const size_t shrink_super_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
+                            const size_t shrink_easy_ef =
+                                std::max((size_t)1, configured_ef_cur / (size_t)2);
+                            const size_t shrink_mid_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
+                            const size_t shrink_edge_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
+
+                            if (super_easy_policy_enabled && is_super_easy_query) {
+                                shrunk_ef_cur = shrink_super_easy_ef;
+                            } else if (is_easy_query) {
+                                if (mid_easy_bucket_policy_enabled) {
+                                    shrunk_ef_cur = is_mid_easy_query
+                                        ? shrink_mid_easy_ef
+                                        : shrink_edge_easy_ef;
+                                } else {
+                                    shrunk_ef_cur = shrink_easy_ef;
+                                }
+                            }
+                            shrunk_ef_cur = std::max(shrunk_ef_cur, k);
                         }
-                        shrunk_ef_cur = std::max(shrunk_ef_cur, k);
 
                         if (shrunk_ef_cur < ef_cur) {
                             ef_cur = shrunk_ef_cur;
@@ -1141,6 +1325,187 @@ searchBaseLayerAdaptiveAnalysisCore(
 
 
 template <bool bare_bone_search>
+TargetHitStepStats
+searchBaseLayerBeamWidthFirstTargetHitStepCore(
+    tableint ep_id,
+    const void *data_point,
+    size_t k,
+    size_t ef_before,
+    size_t switch_pop,
+    size_t switch_full_pop,
+    size_t ef_after,
+    const labeltype* target_labels,
+    size_t target_label_count,
+    size_t target_hit_count,
+    BaseFilterFunctor* isIdAllowed
+) const {
+    TargetHitStepStats stats;
+    stats.target_hit_count = target_hit_count;
+    if (target_hit_count == 0) {
+        stats.reached_target = 1;
+        return stats;
+    }
+
+    const size_t normalized_ef_before = std::max<size_t>(ef_before, k);
+    const size_t normalized_ef_after = std::max<size_t>(ef_after, k);
+    size_t ef_cur = normalized_ef_before;
+    const size_t reserve_ef = std::max(normalized_ef_before, normalized_ef_after);
+    bool phase_switch_applied = false;
+    size_t pop_count = 0;
+    size_t full_pop_count = 0;
+
+    VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+    vl_type *visited_array = vl->mass;
+    vl_type visited_array_tag = vl->curV;
+
+    std::vector<std::pair<dist_t, tableint>> top_container;
+    top_container.reserve(reserve_ef + 1);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> top_candidates(CompareByFirst(), std::move(top_container));
+
+    std::vector<std::pair<dist_t, tableint>> candidate_container;
+    candidate_container.reserve(reserve_ef * 2);
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst> candidate_set(CompareByFirst(), std::move(candidate_container));
+
+    dist_t lowerBound;
+
+    if constexpr (bare_bone_search) {
+        dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+        top_candidates.emplace(dist, ep_id);
+        lowerBound = dist;
+        candidate_set.emplace(-dist, ep_id);
+    } else {
+        if (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id)))) {
+            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            top_candidates.emplace(dist, ep_id);
+            lowerBound = dist;
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+    }
+    visited_array[ep_id] = visited_array_tag;
+
+    while (!candidate_set.empty()) {
+        auto current_node_pair = candidate_set.top();
+        dist_t candidate_dist = -current_node_pair.first;
+
+        if (candidate_dist > lowerBound && top_candidates.size() == ef_cur)
+            break;
+
+        candidate_set.pop();
+        tableint curr_id = current_node_pair.second;
+        pop_count++;
+
+        int *data = (int*)get_linklist0(curr_id);
+        size_t size = getListCount((linklistsizeint*)data);
+        tableint *datal = (tableint *)(data + 1);
+
+#ifdef USE_SSE
+        _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+        _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
+        _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+#endif
+
+        for (size_t j = 0; j < size; j++) {
+            tableint cand_id = *(datal + j);
+#ifdef USE_SSE
+            if (j + 1 < size) {
+                _mm_prefetch((char *)(visited_array + *(datal + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
+            }
+#endif
+            if (visited_array[cand_id] == visited_array_tag) continue;
+            visited_array[cand_id] = visited_array_tag;
+
+            dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+
+            if (top_candidates.size() < ef_cur || lowerBound > d) {
+                candidate_set.emplace(-d, cand_id);
+#ifdef USE_SSE
+                _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
+#endif
+
+                if constexpr (bare_bone_search) {
+                    top_candidates.emplace(d, cand_id);
+                } else {
+                    if (!isMarkedDeleted(cand_id)) {
+                        if (!isIdAllowed || (*isIdAllowed)(getExternalLabel(cand_id))) {
+                            top_candidates.emplace(d, cand_id);
+                        }
+                    }
+                }
+
+                if (top_candidates.size() > ef_cur)
+                    top_candidates.pop();
+
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.top().first;
+            }
+        }
+
+        if (!phase_switch_applied && switch_pop > 0 && pop_count >= switch_pop) {
+            phase_switch_applied = true;
+            const size_t prev_ef = ef_cur;
+            ef_cur = normalized_ef_after;
+            if (ef_cur < prev_ef) {
+                while (top_candidates.size() > ef_cur) {
+                    top_candidates.pop();
+                }
+                if (!top_candidates.empty()) {
+                    lowerBound = top_candidates.top().first;
+                }
+            }
+        }
+
+        if (top_candidates.size() == ef_cur) {
+            full_pop_count++;
+            if (!phase_switch_applied && switch_full_pop > 0 && full_pop_count >= switch_full_pop) {
+                phase_switch_applied = true;
+                const size_t prev_ef = ef_cur;
+                ef_cur = normalized_ef_after;
+                if (ef_cur < prev_ef) {
+                    while (top_candidates.size() > ef_cur) {
+                        top_candidates.pop();
+                    }
+                    if (!top_candidates.empty()) {
+                        lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+        }
+
+        const size_t current_hit_count = computeTopKTargetHitCount(
+            top_candidates,
+            k,
+            target_labels,
+            target_label_count
+        );
+        stats.achieved_hit_count = std::max(stats.achieved_hit_count, current_hit_count);
+        if (current_hit_count >= target_hit_count) {
+            stats.first_target_hit_step = pop_count;
+            stats.reached_target = 1;
+            break;
+        }
+    }
+
+    if (!stats.reached_target) {
+        stats.achieved_hit_count = std::max(
+            stats.achieved_hit_count,
+            computeTopKTargetHitCount(top_candidates, k, target_labels, target_label_count)
+        );
+    }
+
+    visited_list_pool_->releaseVisitedList(vl);
+    return stats;
+}
+
+template <bool bare_bone_search, bool paper_bucket_mode>
 std::priority_queue<std::pair<dist_t, tableint>,
                     std::vector<std::pair<dist_t, tableint>>,
                     CompareByFirst>
@@ -1155,7 +1520,12 @@ searchBaseLayerAdaptiveLightCore(
     float  early_stop_ratio,
     BaseFilterFunctor* isIdAllowed,
     float  super_easy_gamma_ratio,
-    float  mid_easy_upper_gamma_ratio
+    float  mid_easy_upper_gamma_ratio,
+    size_t paper_bucket_count,
+    const std::vector<float>& paper_bucket_gamma_ratios,
+    int    classify_start = 4,
+    int    classify_end = 16,
+    float  chr_ema_decay = 0.8f
 ) const {
     static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
     size_t ef_cur = std::max<size_t>(ef_init, k);
@@ -1170,10 +1540,10 @@ searchBaseLayerAdaptiveLightCore(
     int    full_pop_count   = 0;
     int    stagnation_count = 0;
     float  prev_furthest    = std::numeric_limits<float>::max();
-    static constexpr int   CLASSIFY_START  = 4;
-    static constexpr int   CLASSIFY_END    = 16;
-    static constexpr float CHR_EMA_DECAY = 0.8f;
-    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+    const int   CLASSIFY_START = classify_start;
+    const int   CLASSIFY_END = classify_end;
+    const float CHR_EMA_DECAY = chr_ema_decay;
+    const float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
 
     float  smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
     float  classify_smoothed_chr_sum = 0.0f;
@@ -1181,9 +1551,12 @@ searchBaseLayerAdaptiveLightCore(
     float  classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
     const bool direct_classifier_threshold_enabled = std::isfinite(early_stop_ratio);
     const bool super_easy_policy_enabled =
-        direct_classifier_threshold_enabled && std::isfinite(super_easy_gamma_ratio);
+        !paper_bucket_mode
+        && direct_classifier_threshold_enabled
+        && std::isfinite(super_easy_gamma_ratio);
     const bool mid_easy_bucket_policy_enabled =
-        direct_classifier_threshold_enabled
+        !paper_bucket_mode
+        && direct_classifier_threshold_enabled
         && std::isfinite(mid_easy_upper_gamma_ratio);
     const int effective_tmin_pops =
         direct_classifier_threshold_enabled
@@ -1318,11 +1691,13 @@ searchBaseLayerAdaptiveLightCore(
                         if (is_easy_query) {
                             float classify_chr_ratio =
                                 classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
-                            if (super_easy_policy_enabled) {
-                                is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
-                            }
-                            if (mid_easy_bucket_policy_enabled) {
-                                is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                            if constexpr (!paper_bucket_mode) {
+                                if (super_easy_policy_enabled) {
+                                    is_super_easy_query = classify_chr_ratio <= super_easy_gamma_ratio;
+                                }
+                                if (mid_easy_bucket_policy_enabled) {
+                                    is_mid_easy_query = classify_chr_ratio <= mid_easy_upper_gamma_ratio;
+                                }
                             }
                         }
                     }
@@ -1333,24 +1708,38 @@ searchBaseLayerAdaptiveLightCore(
                     // as hard after the shrink decision.
                     if (ENABLE_ONE_SHOT_EFFECTIVE_EF_SHRINK && !effective_ef_shrink_applied) {
                         size_t shrunk_ef_cur = configured_ef_cur;
-                        const size_t shrink_super_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
-                        const size_t shrink_easy_ef =
-                            std::max((size_t)1, configured_ef_cur / (size_t)2);
-                        const size_t shrink_mid_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
-                        const size_t shrink_edge_easy_ef =
-                            resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
-                        if (super_easy_policy_enabled && is_super_easy_query) {
-                            shrunk_ef_cur = shrink_super_easy_ef;
-                        } else if (is_easy_query) {
-                            if (mid_easy_bucket_policy_enabled) {
-                                shrunk_ef_cur = is_mid_easy_query ? shrink_mid_easy_ef : shrink_edge_easy_ef;
-                            } else {
-                                shrunk_ef_cur = shrink_easy_ef;
+                        if constexpr (paper_bucket_mode) {
+                            if (is_easy_query) {
+                                const float classify_chr_ratio =
+                                    classify_chr_mean / std::max(early_stop_ratio, 1e-6f);
+                                shrunk_ef_cur = resolvePaperBucketShrinkEf(
+                                    configured_ef_cur,
+                                    k,
+                                    paper_bucket_count,
+                                    classify_chr_ratio,
+                                    paper_bucket_gamma_ratios
+                                );
                             }
+                        } else {
+                            const size_t shrink_super_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.25, (size_t)128);
+                            const size_t shrink_easy_ef =
+                                std::max((size_t)1, configured_ef_cur / (size_t)2);
+                            const size_t shrink_mid_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.50, (size_t)128);
+                            const size_t shrink_edge_easy_ef =
+                                resolveScaledShrinkEf(configured_ef_cur, 0.75, (size_t)256);
+                            if (super_easy_policy_enabled && is_super_easy_query) {
+                                shrunk_ef_cur = shrink_super_easy_ef;
+                            } else if (is_easy_query) {
+                                if (mid_easy_bucket_policy_enabled) {
+                                    shrunk_ef_cur = is_mid_easy_query ? shrink_mid_easy_ef : shrink_edge_easy_ef;
+                                } else {
+                                    shrunk_ef_cur = shrink_easy_ef;
+                                }
+                            }
+                            shrunk_ef_cur = std::max(shrunk_ef_cur, k);
                         }
-                        shrunk_ef_cur = std::max(shrunk_ef_cur, k);
 
                         if (shrunk_ef_cur < ef_cur) {
                             ef_cur = shrunk_ef_cur;
@@ -1422,9 +1811,12 @@ searchBaseLayerAdaptiveLightCore(
         BaseFilterFunctor* isIdAllowed = nullptr,
         float early_stop_ratio = 0.6f,
         float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
-        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
     ) const {
-        return searchBaseLayerAdaptiveAnalysisCore<bare_bone_search>(
+        return searchBaseLayerAdaptiveAnalysisCore<bare_bone_search, false>(
             ep_id, data_point, k,
             ef_init, ef_max,
             tmin_pops,
@@ -1433,7 +1825,49 @@ searchBaseLayerAdaptiveLightCore(
             early_stop_ratio,
             isIdAllowed,
             super_easy_gamma_ratio,
-            mid_easy_upper_gamma_ratio
+            mid_easy_upper_gamma_ratio,
+            0,
+            {},
+            classify_start,
+            classify_end,
+            chr_ema_decay
+        );
+    }
+
+    template <bool bare_bone_search>
+    AdaptiveSearchResult
+    searchBaseLayerAdaptiveAnalysisPaperBucket(
+        tableint ep_id,
+        const void *data_point,
+        size_t k,
+        size_t ef_init,
+        size_t ef_max,
+        size_t tmin_pops,
+        bool   enable_stop,
+        size_t stop_step,
+        BaseFilterFunctor* isIdAllowed,
+        float early_stop_ratio,
+        size_t paper_bucket_count,
+        const std::vector<float>& paper_bucket_gamma_ratios,
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
+    ) const {
+        return searchBaseLayerAdaptiveAnalysisCore<bare_bone_search, true>(
+            ep_id, data_point, k,
+            ef_init, ef_max,
+            tmin_pops,
+            enable_stop,
+            stop_step,
+            early_stop_ratio,
+            isIdAllowed,
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            paper_bucket_count,
+            paper_bucket_gamma_ratios,
+            classify_start,
+            classify_end,
+            chr_ema_decay
         );
     }
 
@@ -1451,10 +1885,13 @@ searchBaseLayerAdaptiveLightCore(
         float early_stop_ratio = 0.6f,
         size_t tmin_pops = 25,
         float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
-        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
     ) const {
         constexpr size_t ef_max = 1024;
-        return searchBaseLayerAdaptiveLightCore<bare_bone_search>(
+        return searchBaseLayerAdaptiveLightCore<bare_bone_search, false>(
             ep_id, data_point, k,
             ef_init, ef_max,
             enable_stop,
@@ -1462,8 +1899,103 @@ searchBaseLayerAdaptiveLightCore(
             early_stop_ratio,
             isIdAllowed,
             super_easy_gamma_ratio,
-            mid_easy_upper_gamma_ratio
+            mid_easy_upper_gamma_ratio,
+            0,
+            {},
+            classify_start,
+            classify_end,
+            chr_ema_decay
         );
+    }
+
+    template <bool bare_bone_search>
+    std::priority_queue<std::pair<dist_t, tableint>,
+                    std::vector<std::pair<dist_t, tableint>>,
+                    CompareByFirst>
+    searchBaseLayerAdaptiveLightPaperBucket(
+        tableint ep_id,
+        const void *data_point,
+        size_t k,
+        size_t ef_init,
+        bool   enable_stop,
+        BaseFilterFunctor* isIdAllowed,
+        float early_stop_ratio,
+        size_t tmin_pops,
+        size_t paper_bucket_count,
+        const std::vector<float>& paper_bucket_gamma_ratios,
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
+    ) const {
+        constexpr size_t ef_max = 1024;
+        return searchBaseLayerAdaptiveLightCore<bare_bone_search, true>(
+            ep_id, data_point, k,
+            ef_init, ef_max,
+            enable_stop,
+            tmin_pops,
+            early_stop_ratio,
+            isIdAllowed,
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            paper_bucket_count,
+            paper_bucket_gamma_ratios,
+            classify_start,
+            classify_end,
+            chr_ema_decay
+        );
+    }
+
+    TargetHitStepStats
+    searchKnnBeamWidthFirstTargetHitStep(
+        const void *query_data,
+        size_t k,
+        size_t ef_before,
+        size_t switch_pop,
+        size_t switch_full_pop,
+        size_t ef_after,
+        const labeltype* target_labels,
+        size_t target_label_count,
+        size_t target_hit_count,
+        BaseFilterFunctor* isIdAllowed = nullptr
+    ) const {
+        TargetHitStepStats result;
+        result.target_hit_count = target_hit_count;
+        if (cur_element_count == 0) {
+            return result;
+        }
+
+        tableint ep = getBaseLayerEntry(query_data);
+
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            return searchBaseLayerBeamWidthFirstTargetHitStepCore<true>(
+                ep,
+                query_data,
+                k,
+                ef_before,
+                switch_pop,
+                switch_full_pop,
+                ef_after,
+                target_labels,
+                target_label_count,
+                target_hit_count,
+                isIdAllowed
+            );
+        } else {
+            return searchBaseLayerBeamWidthFirstTargetHitStepCore<false>(
+                ep,
+                query_data,
+                k,
+                ef_before,
+                switch_pop,
+                switch_full_pop,
+                ef_after,
+                target_labels,
+                target_label_count,
+                target_hit_count,
+                isIdAllowed
+            );
+        }
     }
 
     AdaptiveSearchResult
@@ -1478,7 +2010,10 @@ searchBaseLayerAdaptiveLightCore(
         BaseFilterFunctor* isIdAllowed = nullptr,
         float early_stop_ratio = 0.6f,
         float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
-        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+        float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
     ) const {
         AdaptiveSearchResult result;
         if (cur_element_count == 0) {
@@ -1499,7 +2034,10 @@ searchBaseLayerAdaptiveLightCore(
                 isIdAllowed,
                 early_stop_ratio,
                 super_easy_gamma_ratio,
-                mid_easy_upper_gamma_ratio
+                mid_easy_upper_gamma_ratio,
+                classify_start,
+                classify_end,
+                chr_ema_decay
             );
         } else {
             return searchBaseLayerAdaptiveAnalysis<false>(
@@ -1511,9 +2049,68 @@ searchBaseLayerAdaptiveLightCore(
                 isIdAllowed,
                 early_stop_ratio,
                 super_easy_gamma_ratio,
-                mid_easy_upper_gamma_ratio
+                mid_easy_upper_gamma_ratio,
+                classify_start,
+                classify_end,
+                chr_ema_decay
             );
         }
+    }
+
+    AdaptiveSearchResult
+    searchKnnAdaptiveAnalysisPaperBucket(
+        const void *query_data,
+        size_t k,
+        size_t ef_init,
+        size_t ef_max,
+        size_t tmin_pops,
+        bool   enable_stop,
+        size_t stop_step,
+        BaseFilterFunctor* isIdAllowed,
+        float early_stop_ratio,
+        size_t paper_bucket_count,
+        const std::vector<float>& paper_bucket_gamma_ratios,
+        int classify_start = 4,
+        int classify_end = 16,
+        float chr_ema_decay = 0.8f
+    ) const {
+        AdaptiveSearchResult result;
+        if (cur_element_count == 0) {
+            return result;
+        }
+
+        tableint ep = getBaseLayerEntry(query_data);
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            return searchBaseLayerAdaptiveAnalysisPaperBucket<true>(
+                ep, query_data, k,
+                ef_init, ef_max,
+                tmin_pops,
+                enable_stop,
+                stop_step,
+                isIdAllowed,
+                early_stop_ratio,
+                paper_bucket_count,
+                paper_bucket_gamma_ratios,
+                classify_start,
+                classify_end,
+                chr_ema_decay
+            );
+        }
+        return searchBaseLayerAdaptiveAnalysisPaperBucket<false>(
+            ep, query_data, k,
+            ef_init, ef_max,
+            tmin_pops,
+            enable_stop,
+            stop_step,
+            isIdAllowed,
+            early_stop_ratio,
+            paper_bucket_count,
+            paper_bucket_gamma_ratios,
+            classify_start,
+            classify_end,
+            chr_ema_decay
+        );
     }
 
    std::priority_queue<std::pair<dist_t, labeltype>>
@@ -1526,7 +2123,10 @@ searchKnnAdaptiveLight(
     float early_stop_ratio = 0.6f,
     size_t tmin_pops = 25,
     float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
-    float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN()
+    float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN(),
+    int classify_start = 4,
+    int classify_end = 16,
+    float chr_ema_decay = 0.8f
 ) const {
     std::priority_queue<std::pair<dist_t, labeltype>> result;
     if (cur_element_count == 0) {
@@ -1543,13 +2143,19 @@ searchKnnAdaptiveLight(
         top_candidates = searchBaseLayerAdaptiveLight<true>(
             ep, query_data, k, ef_init, enable_stop, isIdAllowed, early_stop_ratio, tmin_pops,
             super_easy_gamma_ratio,
-            mid_easy_upper_gamma_ratio
+            mid_easy_upper_gamma_ratio,
+            classify_start,
+            classify_end,
+            chr_ema_decay
         );
     } else {
         top_candidates = searchBaseLayerAdaptiveLight<false>(
             ep, query_data, k, ef_init, enable_stop, isIdAllowed, early_stop_ratio, tmin_pops,
             super_easy_gamma_ratio,
-            mid_easy_upper_gamma_ratio
+            mid_easy_upper_gamma_ratio,
+            classify_start,
+            classify_end,
+            chr_ema_decay
         );
     }
 
@@ -1561,6 +2167,82 @@ searchKnnAdaptiveLight(
         result_vec.emplace_back(
             top_candidates.top().first,
             getExternalLabel(top_candidates.top().second) // 여기서 변환
+        );
+        top_candidates.pop();
+    }
+
+    return std::priority_queue<std::pair<dist_t, labeltype>>(
+        std::less<std::pair<dist_t, labeltype>>(),
+        std::move(result_vec)
+    );
+}
+
+   std::priority_queue<std::pair<dist_t, labeltype>>
+searchKnnAdaptiveLightPaperBucket(
+    const void *query_data,
+    size_t k,
+    size_t ef_init,
+    bool   enable_stop,
+    BaseFilterFunctor* isIdAllowed,
+    float early_stop_ratio,
+    size_t tmin_pops,
+    size_t paper_bucket_count,
+    const std::vector<float>& paper_bucket_gamma_ratios,
+    int classify_start = 4,
+    int classify_end = 16,
+    float chr_ema_decay = 0.8f
+) const {
+    std::priority_queue<std::pair<dist_t, labeltype>> result;
+    if (cur_element_count == 0) {
+        return result;
+    }
+
+    tableint ep = getBaseLayerEntry(query_data);
+    bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+
+    if (bare_bone_search) {
+        top_candidates = searchBaseLayerAdaptiveLightPaperBucket<true>(
+            ep,
+            query_data,
+            k,
+            ef_init,
+            enable_stop,
+            isIdAllowed,
+            early_stop_ratio,
+            tmin_pops,
+            paper_bucket_count,
+            paper_bucket_gamma_ratios,
+            classify_start,
+            classify_end,
+            chr_ema_decay
+        );
+    } else {
+        top_candidates = searchBaseLayerAdaptiveLightPaperBucket<false>(
+            ep,
+            query_data,
+            k,
+            ef_init,
+            enable_stop,
+            isIdAllowed,
+            early_stop_ratio,
+            tmin_pops,
+            paper_bucket_count,
+            paper_bucket_gamma_ratios,
+            classify_start,
+            classify_end,
+            chr_ema_decay
+        );
+    }
+
+    std::vector<std::pair<dist_t, labeltype>> result_vec;
+    result_vec.reserve(top_candidates.size());
+
+    while (!top_candidates.empty()) {
+        result_vec.emplace_back(
+            top_candidates.top().first,
+            getExternalLabel(top_candidates.top().second)
         );
         top_candidates.pop();
     }
