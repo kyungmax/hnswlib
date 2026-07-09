@@ -388,6 +388,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         step.shadow_512_dist = std::numeric_limits<float>::quiet_NaN();
         step.top_2k_dist = std::numeric_limits<float>::quiet_NaN();
         step.top_3k_dist = std::numeric_limits<float>::quiet_NaN();
+        step.top_k_node_ids.clear();
         step.furthest_vec.clear();
 
         if (top_candidates.empty()) {
@@ -423,6 +424,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         step.shadow_512_dist = rankDistanceOrNaN(sorted_candidates, 512);
         step.top_2k_dist = rankDistanceOrNaN(sorted_candidates, k * 2);
         step.top_3k_dist = rankDistanceOrNaN(sorted_candidates, k * 3);
+
+        const size_t top_k_limit = std::min(k, sorted_candidates.size());
+        step.top_k_node_ids.reserve(top_k_limit);
+        for (size_t i = 0; i < top_k_limit; ++i) {
+            step.top_k_node_ids.push_back(sorted_candidates[i].second);
+        }
 
         tableint furthest_id = sorted_candidates.back().second;
         float* vec_ptr = (float*)getDataByInternalId(furthest_id);

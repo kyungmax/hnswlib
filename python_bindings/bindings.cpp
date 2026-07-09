@@ -291,6 +291,12 @@ class Index {
         d["shadow_512_dist"] = s.shadow_512_dist;
         d["top_2k_dist"] = s.top_2k_dist;
         d["top_3k_dist"] = s.top_3k_dist;
+        std::vector<hnswlib::labeltype> top_k_labels;
+        top_k_labels.reserve(s.top_k_node_ids.size());
+        for (const auto internal_id : s.top_k_node_ids) {
+            top_k_labels.push_back(appr_alg->getExternalLabel(internal_id));
+        }
+        d["top_k_labels"] = top_k_labels;
         d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
         return d;
     }
@@ -2630,6 +2636,12 @@ Legacy experiment scripts may still call `knn_query_adaptive_light_paper_bucket`
                     d["shadow_512_dist"] = s.shadow_512_dist;
                     d["top_2k_dist"] = s.top_2k_dist;
                     d["top_3k_dist"] = s.top_3k_dist;
+                    std::vector<hnswlib::labeltype> top_k_labels;
+                    top_k_labels.reserve(s.top_k_node_ids.size());
+                    for (const auto internal_id : s.top_k_node_ids) {
+                        top_k_labels.push_back(index.appr_alg->getExternalLabel(internal_id));
+                    }
+                    d["top_k_labels"] = top_k_labels;
                     d["furthest_vec"] = py::array_t<float>(s.furthest_vec.size(), s.furthest_vec.data());
                     py_steps.push_back(d);
                 }
